@@ -86,6 +86,8 @@ if not _allowed or _email not in _allowed:
     st.title("DK Projections")
     st.error("Your account isn't authorized to view this app. "
              "Contact the projections team if you believe this is a mistake.")
+    st.caption(f"Debug — detected email: {st.user.email!r} · "
+               f"allow-list entries loaded: {len(_allowed)}")
     st.button("Sign out", on_click=st.logout)
     st.stop()
 
