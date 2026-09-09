@@ -194,9 +194,9 @@ def list_saves(week: int, game: str | None = None) -> list[dict]:
     )
 
 
-def load_projector_weights() -> pd.DataFrame:
+def _load_weights_matrix(sheet_id: str) -> pd.DataFrame:
     """
-    Load projector weights from the private weights sheet.
+    Load a projector-weights matrix from a weights sheet.
 
     Layout: A1 empty (or "Team"), A2:A33 = team abbreviations,
     B1:XX1 = projector Save Key IDs, B2:XX33 = weights (0-1).
@@ -206,7 +206,7 @@ def load_projector_weights() -> pd.DataFrame:
     """
     try:
         gc = _get_gc()
-        sh = gc.open_by_key(_WEIGHTS_SHEET_ID)
+        sh = gc.open_by_key(sheet_id)
         ws = sh.sheet1
         all_vals = ws.get_all_values()
         if not all_vals or len(all_vals) < 2:
@@ -224,5 +224,28 @@ def load_projector_weights() -> pd.DataFrame:
             df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
         return df
     except Exception as e:
-        logger.error(f"load_projector_weights failed: {e}")
+        logger.error(f"_load_weights_matrix({sheet_id}) failed: {e}")
         return pd.DataFrame()
+
+
+def load_projector_weights() -> pd.DataFrame:
+    """Trader-dashboard projector weights (the private weights sheet)."""
+    return _load_weights_matrix(_WEIGHTS_SHEET_ID)
+
+
+def load_client_projector_weights() -> pd.DataFrame:
+    """Client-dashboard projector weights — a SEPARATE sheet, used only by the
+    client app. Its id comes from the client app's own secret
+    `client_weights_sheet_id`; if that's unset, returns empty so the client
+    view falls back to an equal average. Never affects the trader dashboard.
+    """
+    sheet_id = None
+    if _USE_STREAMLIT_SECRETS:
+        try:
+            import streamlit as st
+            sheet_id = st.secrets.get("client_weights_sheet_id")
+        except Exception:
+            sheet_id = None
+    if not sheet_id:
+        return pd.DataFrame()
+    return _load_weights_matrix(sheet_id)

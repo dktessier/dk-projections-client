@@ -48,6 +48,46 @@ def _preferred_display_name(names) -> str:
     return sorted(pool, key=lambda s: (-len(s), s))[0]
 
 
+def _equal_average(game_df, num_cols):
+    return game_df.groupby(["player_name", "position", "_team"])[num_cols].mean().round(2).reset_index()
+
+
+def _weighted_display_df(game_df, num_cols, wt_df):
+    """Per-player display frame using a projector-weight matrix (team x projector,
+    0-1). Falls back to an equal average per team wherever weights are empty or
+    sum to zero, and overall if the matrix is empty. Used by the trader
+    'Average' (trader weights) and the client view (client weights)."""
+    if wt_df is None or wt_df.empty or "Projector" not in game_df.columns or "_team" not in game_df.columns:
+        return _equal_average(game_df, num_cols)
+    parts = []
+    for _team_key in game_df["_team"].unique():
+        _team_rows = game_df[game_df["_team"] == _team_key]
+        _team_wts = wt_df.loc[_team_key] if _team_key in wt_df.index else pd.Series(dtype=float)
+        if _team_wts.empty or _team_wts.sum() == 0:
+            parts.append(_equal_average(_team_rows, num_cols))
+            continue
+        _wt_rows = []
+        for (_pname, _pos, _tm), _pg in _team_rows.groupby(["player_name", "position", "_team"]):
+            _total_w = 0.0
+            _accum = {c: 0.0 for c in num_cols if c in _pg.columns}
+            for _, _r in _pg.iterrows():
+                _w = float(_team_wts.get(_r.get("Projector", ""), 0))
+                if _w <= 0:
+                    continue
+                _total_w += _w
+                for _c in _accum:
+                    _v = pd.to_numeric(_r.get(_c), errors="coerce")
+                    if pd.notna(_v):
+                        _accum[_c] += _w * _v
+            if _total_w > 0:
+                _row_out = {"player_name": _pname, "position": _pos, "_team": _tm}
+                for _c in _accum:
+                    _row_out[_c] = round(_accum[_c] / _total_w, 2)
+                _wt_rows.append(_row_out)
+        parts.append(pd.DataFrame(_wt_rows) if _wt_rows else _equal_average(_team_rows, num_cols))
+    return pd.concat(parts, ignore_index=True) if parts else _equal_average(game_df, num_cols)
+
+
 def _logo_b64(abbr: str) -> str:
     p = get_team_logo_path(abbr)
     if not p:
@@ -140,8 +180,9 @@ def render_dk_projections(next_week, *, show_projector=True):
                 _all_projectors = sorted(_dk_filt["Projector"].dropna().unique().tolist()) if "Projector" in _dk_filt.columns else []
                 _dk_projector = st.selectbox("Projector", ["Average"] + _all_projectors, key="dk_projector_filter")
         else:
-            # Locked client view: plain equal average of all projectors.
-            _dk_projector = "__EQUAL_AVG__"
+            # Locked client view: weighted blend using the CLIENT weights sheet,
+            # which defaults to an equal average wherever weights are unset.
+            _dk_projector = "__CLIENT_WEIGHTED__"
 
         # Scenario filter — only show if there are projections with players out
         _all_scenarios = sorted(_dk_filt["Scenario"].unique().tolist()) if "Scenario" in _dk_filt.columns else []
@@ -196,54 +237,15 @@ def render_dk_projections(next_week, *, show_projector=True):
                 _t2 = _game_teams[-1].strip() if len(_game_teams) > 1 else ""
 
                 # Build display data
-                if _dk_projector == "__EQUAL_AVG__":
-                    # Locked client view: unweighted mean across all projectors.
-                    _disp_df = _game_df.groupby(["player_name", "position", "_team"])[_num_cols].mean().round(2).reset_index()
+                if _dk_projector == "__CLIENT_WEIGHTED__":
+                    # Client view: weighted by the client weights sheet (equal
+                    # average where unset). Never reads the trader weights.
+                    from sheets import load_client_projector_weights
+                    _disp_df = _weighted_display_df(_game_df, _num_cols, load_client_projector_weights())
                 elif _dk_projector == "Average":
-                    # Weighted average using projector weights from private sheet
+                    # Trader view: weighted average using the trader weights sheet.
                     from sheets import load_projector_weights
-                    _wt_df = load_projector_weights()
-                    if not _wt_df.empty and "Projector" in _game_df.columns and "_team" in _game_df.columns:
-                        _weighted_parts = []
-                        for _team_key in _game_df["_team"].unique():
-                            _team_rows = _game_df[_game_df["_team"] == _team_key]
-                            _team_wts = _wt_df.loc[_team_key] if _team_key in _wt_df.index else pd.Series(dtype=float)
-                            if _team_wts.empty or _team_wts.sum() == 0:
-                                # Fallback: equal average
-                                _weighted_parts.append(
-                                    _team_rows.groupby(["player_name", "position", "_team"])[_num_cols].mean().reset_index()
-                                )
-                            else:
-                                # Weighted average per player
-                                _player_groups = _team_rows.groupby(["player_name", "position", "_team"])
-                                _wt_rows = []
-                                for (_pname, _pos, _tm), _pg in _player_groups:
-                                    _total_w = 0.0
-                                    _accum = {c: 0.0 for c in _num_cols if c in _pg.columns}
-                                    for _, _r in _pg.iterrows():
-                                        _proj_name = _r.get("Projector", "")
-                                        _w = float(_team_wts.get(_proj_name, 0))
-                                        if _w <= 0:
-                                            continue
-                                        _total_w += _w
-                                        for _c in _accum:
-                                            _v = pd.to_numeric(_r.get(_c), errors="coerce")
-                                            if pd.notna(_v):
-                                                _accum[_c] += _w * _v
-                                    if _total_w > 0:
-                                        _row_out = {"player_name": _pname, "position": _pos, "_team": _tm}
-                                        for _c in _accum:
-                                            _row_out[_c] = round(_accum[_c] / _total_w, 2)
-                                        _wt_rows.append(_row_out)
-                                if _wt_rows:
-                                    _weighted_parts.append(pd.DataFrame(_wt_rows))
-                                else:
-                                    _weighted_parts.append(
-                                        _team_rows.groupby(["player_name", "position", "_team"])[_num_cols].mean().reset_index()
-                                    )
-                        _disp_df = pd.concat(_weighted_parts, ignore_index=True) if _weighted_parts else _game_df.groupby(["player_name", "position", "_team"])[_num_cols].mean().round(2).reset_index()
-                    else:
-                        _disp_df = _game_df.groupby(["player_name", "position", "_team"])[_num_cols].mean().round(2).reset_index()
+                    _disp_df = _weighted_display_df(_game_df, _num_cols, load_projector_weights())
                 else:
                     _proj_df = _game_df[_game_df.Projector == _dk_projector]
                     if _proj_df.empty:
