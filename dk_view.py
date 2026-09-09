@@ -7,12 +7,45 @@ client view: no Projector dropdown, output is the plain equal average of
 all projectors for each game.
 """
 import base64 as _b64
+import re as _re
 import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as _stc
 
 from team_meta import get_team_color, get_team_name, get_team_logo_path
 from sheets import load_projections as _sheets_read, load_projector_weights
+
+# Generational suffix (Jr./Sr./II…V). The saved sheet stores only player_name
+# (no id), so if the roster source changed a name between saves — e.g. started
+# appending "Jr." — the same player is stored under two strings and splits into
+# two rows in the averages. We collapse those variants on the suffix-stripped
+# name and display the fuller form.
+_NAME_SUFFIX_RE = _re.compile(r"\s+(Jr\.?|Sr\.?|II|III|IV|V)$", _re.IGNORECASE)
+
+# Display-only name overrides for downstream mapping: force these players to
+# show with a suffix regardless of how the roster source spelled them when the
+# projection was saved. Keyed on the suffix-stripped, lowercased name. Does not
+# change saved data or the internal Save flow — only the DK Projections labels.
+_NAME_DISPLAY_OVERRIDES = {
+    "brian robinson": "Brian Robinson Jr.",
+    "travis etienne": "Travis Etienne Jr.",
+    "harold fannin": "Harold Fannin Jr.",
+    "brian thomas": "Brian Thomas Jr.",
+    "oronde gadsden": "Oronde Gadsden II",
+}
+
+
+def _canon_player_name(n) -> str:
+    return _NAME_SUFFIX_RE.sub("", str(n).strip()).lower()
+
+
+def _preferred_display_name(names) -> str:
+    """Pick the display name for a set of variants: prefer the suffixed form
+    (e.g. 'Marvin Harrison Jr.'), else the longest; deterministic tie-break."""
+    uniq = list(dict.fromkeys(str(n).strip() for n in names))
+    suffixed = [n for n in uniq if _NAME_SUFFIX_RE.search(n)]
+    pool = suffixed if suffixed else uniq
+    return sorted(pool, key=lambda s: (-len(s), s))[0]
 
 
 def _logo_b64(abbr: str) -> str:
@@ -36,9 +69,15 @@ def render_dk_projections(next_week, *, show_projector=True):
 
     if not _dk_df.empty and "saved_at" in _dk_df.columns and "save_key" in _dk_df.columns and "player_name" in _dk_df.columns:
         _dk_df["saved_at"] = pd.to_datetime(_dk_df["saved_at"], errors="coerce")
-        _dk_df = _dk_df.sort_values("saved_at", ascending=False).drop_duplicates(
-            subset=["save_key", "player_name"], keep="first"
-        ).reset_index(drop=True)
+        # De-dupe on the suffix-stripped name so a projector who re-saved a game
+        # after the roster source changed the spelling ("Marvin Harrison" ->
+        # "Marvin Harrison Jr.") keeps only their latest save, not both.
+        _dedup_key = _dk_df["player_name"].map(_canon_player_name)
+        _dk_df = (_dk_df.assign(_dedup_key=_dedup_key)
+                        .sort_values("saved_at", ascending=False)
+                        .drop_duplicates(subset=["save_key", "_dedup_key"], keep="first")
+                        .drop(columns=["_dedup_key"])
+                        .reset_index(drop=True))
 
     if _dk_df.empty:
         st.info(f"No projections saved for Week {_dk_week} yet.")
@@ -60,6 +99,19 @@ def render_dk_projections(next_week, *, show_projector=True):
         # Clean game names (remove underscores)
         if "game" in _dk_df.columns:
             _dk_df["game_clean"] = _dk_df["game"].str.replace("_", " ").str.replace("vs", "vs.")
+
+        # Collapse player-name variants that differ only by a generational
+        # suffix (see _NAME_SUFFIX_RE note) so one player doesn't split into
+        # two rows across saves. Normalize within team; display the fuller form.
+        if "player_name" in _dk_df.columns and "_team" in _dk_df.columns:
+            _pkey = _dk_df["player_name"].map(_canon_player_name)
+            _disp = (_dk_df.assign(_pkey=_pkey)
+                          .groupby(["_team", "_pkey"])["player_name"]
+                          .agg(_preferred_display_name))
+            _dk_df["player_name"] = [
+                _NAME_DISPLAY_OVERRIDES.get(k, _disp.get((t, k), nm))
+                for t, k, nm in zip(_dk_df["_team"], _pkey, _dk_df["player_name"])
+            ]
 
         # Filters
         if show_projector:
