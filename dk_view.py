@@ -32,11 +32,18 @@ _NAME_DISPLAY_OVERRIDES = {
     "harold fannin": "Harold Fannin Jr.",
     "brian thomas": "Brian Thomas Jr.",
     "oronde gadsden": "Oronde Gadsden II",
+    "luther burden": "Luther Burden III",
+    "aj barner": "A.J. Barner",
+    "dj moore": "D.J. Moore",
 }
 
 
 def _canon_player_name(n) -> str:
-    return _NAME_SUFFIX_RE.sub("", str(n).strip()).lower()
+    # Match ignoring generational suffix, periods (AJ vs A.J.), case, and
+    # extra whitespace, so spelling variants of one player collapse together.
+    s = _NAME_SUFFIX_RE.sub("", str(n).strip())
+    s = s.replace(".", "")
+    return _re.sub(r"\s+", " ", s).strip().lower()
 
 
 def _preferred_display_name(names) -> str:
