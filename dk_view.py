@@ -215,7 +215,16 @@ def render_dk_projections(next_week, *, show_projector=True):
             if _c in _dk_filt.columns:
                 _dk_filt[_c] = pd.to_numeric(_dk_filt[_c], errors="coerce")
 
-        if not _dk_filt.empty:
+        # Which games to render:
+        #  - a specific matchup always shows (both teams, even with zero saves,
+        #    so the per-team saved-projection count can render a 0)
+        #  - "All Games" shows every game with >=1 save under the active filters
+        if _dk_game != "All Games":
+            _games_to_render = [_dk_game]
+        else:
+            _games_to_render = sorted(_dk_filt["game_clean"].dropna().unique().tolist())
+
+        if _games_to_render:
             import streamlit.components.v1 as _stc
             _dk_css = '<style>.dk-tbl table{border-collapse:collapse;width:100%;font-family:-apple-system,sans-serif;}.dk-tbl th{padding:6px 8px;font-size:13px;font-weight:800;color:#1a1f26;border-bottom:2px solid #bbb;text-align:center;}.dk-tbl td{padding:6px 8px;border-bottom:1px solid #e8e8e8;font-size:14px;font-weight:500;color:#1a1f26;text-align:center;}.dk-tbl td:first-child,.dk-tbl th:first-child{text-align:left;}</style>'
 
@@ -232,7 +241,21 @@ def render_dk_projections(next_week, *, show_projector=True):
                 html = styled.to_html()
                 _stc.html(f'<html><head>{_dk_css}</head><body><div class="dk-tbl">{html}</div></body></html>', height=52 + len(tbl_df) * 32, scrolling=True)
 
-            _games_to_show = sorted(_dk_filt["game_clean"].dropna().unique().tolist())
+            # Per-team saved-projection count (trader tool only). Counts the
+            # distinct save_keys for a team under the active Game + Scenario
+            # filters — i.e. how many projectors have submitted for that team.
+            # Only shown under the 'Average' view: a specific projector implies
+            # a single projection, so no badge is shown for that selection.
+            def _saved_count(game_clean, team_abbr):
+                if not (show_projector and _dk_projector == "Average"):
+                    return None
+                if "save_key" not in _dk_filt.columns:
+                    return 0
+                _sub = _dk_filt[(_dk_filt["game_clean"] == game_clean)
+                                & (_dk_filt["_team"] == team_abbr)]
+                return int(_sub["save_key"].nunique())
+
+            _games_to_show = _games_to_render
             for _game in _games_to_show:
                 _game_df = _dk_filt[_dk_filt.game_clean == _game]
                 if _game_df.empty:
@@ -293,7 +316,12 @@ def render_dk_projections(next_week, *, show_projector=True):
                     if not _team_abbr:
                         continue
                     _team_df = _disp_df[_disp_df["_team"] == _team_abbr]
-                    if _team_df.empty:
+                    # Under the 'Average' view we always render both teams' headers
+                    # (with the saved-projection count) so a team with no saves
+                    # still shows a 0. For a specific projector / client view,
+                    # keep the original behavior of skipping empty teams.
+                    _show_count = show_projector and _dk_projector == "Average"
+                    if _team_df.empty and not _show_count:
                         continue
 
                     # Team header
@@ -302,7 +330,20 @@ def render_dk_projections(next_week, *, show_projector=True):
                     _tname = get_team_name(_team_abbr)
                     _hdr = f'<img src="data:image/png;base64,{_tlogo}" style="width:32px;height:32px;margin-right:10px;"/>' if _tlogo else ""
                     _hdr += f'<span style="font-size:22px;font-weight:800;color:{_tcolor};">{_tname}</span>'
-                    st.markdown(f'<div style="display:flex;align-items:center;margin:20px 0 6px 0;padding:8px 0;border-bottom:2px solid {_tcolor}40;">{_hdr}</div>', unsafe_allow_html=True)
+                    _cnt = _saved_count(_game, _team_abbr)
+                    _cnt_html = ""
+                    if _cnt is not None:
+                        _cnt_label = "saved projection" if _cnt == 1 else "saved projections"
+                        _cnt_html = (
+                            f'<span title="Number of projectors who have saved a '
+                            f'projection for this team under the selected scenario" '
+                            f'style="margin-left:auto;font-size:14px;font-weight:700;'
+                            f'color:{_tcolor};background:{_tcolor}1a;'
+                            f'border:1px solid {_tcolor}55;padding:2px 14px;'
+                            f'border-radius:14px;">'
+                            f'<b style="font-size:16px;">{_cnt}</b> {_cnt_label}</span>'
+                        )
+                    st.markdown(f'<div style="display:flex;align-items:center;margin:20px 0 6px 0;padding:8px 0;border-bottom:2px solid {_tcolor}40;">{_hdr}{_cnt_html}</div>', unsafe_allow_html=True)
 
                     # Team Volume (show once per team)
                     _tv_cols = ["Plays", "Dropback%", "Sack%", "Throwaway%", "Scramble%"]
