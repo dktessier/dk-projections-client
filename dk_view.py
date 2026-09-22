@@ -15,6 +15,71 @@ import streamlit.components.v1 as _stc
 from team_meta import get_team_color, get_team_name, get_team_logo_path
 from sheets import load_projections as _sheets_read, load_projector_weights
 
+# Odds conversions, duplicated from core.math on purpose: this module is synced
+# into the PUBLIC client repo (deploy/sync-from-private.yml), which ships only
+# client_app/dk_view/sheets/team_meta. Importing core.math here would either
+# break that app on import or publish the desk's pricing module. Two lines of
+# arithmetic is the cheaper copy — tests/test_dk_view_td.py pins them against
+# core.math so they cannot drift.
+def prob_to_american(p):
+    """Fair American price for probability ``p``, or None if unpriceable."""
+    if p <= 0.0 or p >= 1.0:
+        return None
+    if p >= 0.5:
+        return int(round(-100.0 * p / (1.0 - p)))
+    return int(round(100.0 / p - 100.0))
+
+
+def american_to_prob(price):
+    """Implied probability of an American price. Inverse of prob_to_american."""
+    price = float(price)
+    if price == 0.0:
+        return 0.0
+    if price < 0.0:
+        return -price / (-price + 100.0)
+    return 100.0 / (price + 100.0)
+
+
+# American prices cannot be averaged arithmetically (+184 and -119 average to
+# +33, which is not the consensus of anything). Each priced column is carried
+# through the aggregation as a probability under the shadow name below and
+# converted back afterwards by _restore_td_prices.
+_TD_PRICE_COLS = {"td_true": "_p_td_true"}
+
+# The carried probabilities must NOT be rounded to 2dp before they are converted
+# back. A 1% TD share is p=0.0237 (+4116); at 0.02 it prints +4900, and anything
+# under 0.005 rounds to zero and prints blank. Those are exactly the deep-bench
+# TD rows this board exists to price.
+_NO_ROUND = set(_TD_PRICE_COLS.values())
+
+
+def _round_disp(df):
+    """Round display columns to 2dp, leaving the carried probabilities alone."""
+    cols = [c for c in df.columns
+            if c not in _NO_ROUND and pd.api.types.is_numeric_dtype(df[c])]
+    if cols:
+        df[cols] = df[cols].round(2)
+    return df
+
+
+def _fmt_td_price(v):
+    """Display form of an American price: signed, or blank when unpriceable."""
+    if v is None or pd.isna(v):
+        return ""
+    return f"{int(v):+d}"
+
+
+def _restore_td_prices(df):
+    """Turn the averaged probabilities back into American prices."""
+    for _pc, _pp in _TD_PRICE_COLS.items():
+        if _pp not in df.columns:
+            continue
+        df[_pc] = df[_pp].apply(
+            lambda v: prob_to_american(v) if pd.notna(v) and 0 < v < 1 else None
+        )
+        df = df.drop(columns=[_pp])
+    return df
+
 # Generational suffix (Jr./Sr./II…V). The saved sheet stores only player_name
 # (no id), so if the roster source changed a name between saves — e.g. started
 # appending "Jr." — the same player is stored under two strings and splits into
@@ -56,7 +121,9 @@ def _preferred_display_name(names) -> str:
 
 
 def _equal_average(game_df, num_cols):
-    return game_df.groupby(["player_name", "position", "_team"])[num_cols].mean().round(2).reset_index()
+    return _round_disp(
+        game_df.groupby(["player_name", "position", "_team"])[num_cols].mean().reset_index()
+    )
 
 
 def _weighted_display_df(game_df, num_cols, wt_df):
@@ -77,6 +144,13 @@ def _weighted_display_df(game_df, num_cols, wt_df):
         for (_pname, _pos, _tm), _pg in _team_rows.groupby(["player_name", "position", "_team"]):
             _total_w = 0.0
             _accum = {c: 0.0 for c in num_cols if c in _pg.columns}
+            # Weight is tracked PER COLUMN, not once for the player: a projector
+            # who left a cell blank must not count in that column's denominator.
+            # A save made before TD pricing existed has a blank td_true, and
+            # charging it to the divisor as if it were p=0 halved the consensus
+            # probability — +800 rendered +1700. groupby().mean() skips NaN, so
+            # this also keeps the weighted and equal-average paths agreeing.
+            _colw = {c: 0.0 for c in _accum}
             for _, _r in _pg.iterrows():
                 _w = float(_team_wts.get(_r.get("Projector", ""), 0))
                 if _w <= 0:
@@ -86,12 +160,15 @@ def _weighted_display_df(game_df, num_cols, wt_df):
                     _v = pd.to_numeric(_r.get(_c), errors="coerce")
                     if pd.notna(_v):
                         _accum[_c] += _w * _v
+                        _colw[_c] += _w
             if _total_w > 0:
                 _row_out = {"player_name": _pname, "position": _pos, "_team": _tm}
                 for _c in _accum:
-                    _row_out[_c] = round(_accum[_c] / _total_w, 2)
+                    _row_out[_c] = (_accum[_c] / _colw[_c]
+                                    if _colw[_c] > 0 else float("nan"))
                 _wt_rows.append(_row_out)
-        parts.append(pd.DataFrame(_wt_rows) if _wt_rows else _equal_average(_team_rows, num_cols))
+        parts.append(_round_disp(pd.DataFrame(_wt_rows)) if _wt_rows
+                     else _equal_average(_team_rows, num_cols))
     return pd.concat(parts, ignore_index=True) if parts else _equal_average(game_df, num_cols)
 
 
@@ -211,9 +288,26 @@ def render_dk_projections(next_week, *, show_projector=True):
                      "proj_ints", "proj_scrambles", "proj_scramble_yds", "proj_total_rush_yds",
                      "team_plays", "team_dropback_pct", "team_sack_pct", "team_throwaway_pct",
                      "team_scramble_pct", "tgt_share", "carry_share"]
-        for _c in _num_cols:
+        # Anytime-TD pricing is the desk's own fair number, so it renders in the
+        # internal tab only. The client view (show_projector=False) never reads
+        # these columns — flip _show_td to expose them there.
+        _show_td = show_projector
+        if _show_td:
+            _num_cols += ["td_share_pct", "team_td_pts_pct", "team_dst_pct"]
+        # td_true is deliberately NOT in _num_cols — see _TD_PRICE_COLS.
+        _price_cols = _TD_PRICE_COLS if _show_td else {}
+        for _c in list(_num_cols) + list(_price_cols):
             if _c in _dk_filt.columns:
                 _dk_filt[_c] = pd.to_numeric(_dk_filt[_c], errors="coerce")
+        for _pc, _pp in _price_cols.items():
+            if _pc in _dk_filt.columns:
+                _dk_filt[_pp] = _dk_filt[_pc].apply(
+                    lambda v: american_to_prob(v) if pd.notna(v) and v != 0 else float("nan")
+                )
+                _num_cols.append(_pp)
+        # A tab saved before a column was appended comes back without it, and the
+        # groupby below indexes _num_cols directly.
+        _num_cols = [_c for _c in _num_cols if _c in _dk_filt.columns]
 
         # Which games to render:
         #  - a specific matchup always shows (both teams, even with zero saves,
@@ -229,7 +323,8 @@ def render_dk_projections(next_week, *, show_projector=True):
             _dk_css = '<style>.dk-tbl table{border-collapse:collapse;width:100%;font-family:-apple-system,sans-serif;}.dk-tbl th{padding:6px 8px;font-size:13px;font-weight:800;color:#1a1f26;border-bottom:2px solid #bbb;text-align:center;}.dk-tbl td{padding:6px 8px;border-bottom:1px solid #e8e8e8;font-size:14px;font-weight:500;color:#1a1f26;text-align:center;}.dk-tbl td:first-child,.dk-tbl th:first-child{text-align:left;}</style>'
 
             _market_cols = {"Carries", "Rush Yds", "Rec", "Rec Yds", "Total Rush Yds", "Total Rush Att",
-                           "Pass TDs", "INTs", "Pass Att", "Comp", "Pass Yds"}
+                           "Pass TDs", "INTs", "Pass Att", "Comp", "Pass Yds",
+                           "TD True"}
 
             def _dk_render_table(tbl_df):
                 if tbl_df.empty:
@@ -280,7 +375,13 @@ def render_dk_projections(next_week, *, show_projector=True):
                     _proj_df = _game_df[_game_df.Projector == _dk_projector]
                     if _proj_df.empty:
                         continue
-                    _disp_df = _proj_df[["player_name", "position", "_team"] + [c for c in _num_cols if c in _proj_df.columns]].round(2).reset_index(drop=True)
+                    _disp_df = _round_disp(
+                        _proj_df[["player_name", "position", "_team"]
+                                 + [c for c in _num_cols if c in _proj_df.columns]].copy()
+                    ).reset_index(drop=True)
+
+                # Probabilities -> prices. Must run after aggregation, never before.
+                _disp_df = _restore_td_prices(_disp_df)
 
                 # Rename
                 _disp_df = _disp_df.rename(columns={
@@ -301,6 +402,7 @@ def render_dk_projections(next_week, *, show_projector=True):
                     "team_sack_pct": "Sack%", "team_throwaway_pct": "Throwaway%",
                     "team_scramble_pct": "Scramble%",
                     "tgt_share": "Tgt Share", "carry_share": "Carry Share",
+                    "td_share_pct": "TD Share", "td_true": "TD True",
                 })
 
                 # For Others rows: show N/A for snap%/rate columns
@@ -310,6 +412,13 @@ def render_dk_projections(next_week, *, show_projector=True):
                         if _na_col in _disp_df.columns:
                             _disp_df[_na_col] = _disp_df[_na_col].astype(object)
                             _disp_df.loc[_is_others, _na_col] = "N/A"
+
+                # Print TD True with an explicit sign so the column reads as odds
+                # next to a closing line ("+580", not "580"). Done once here, on
+                # the display frame only, so all three tables pick it up — the
+                # saved value and _restore_td_prices stay numeric.
+                if "TD True" in _disp_df.columns:
+                    _disp_df["TD True"] = _disp_df["TD True"].map(_fmt_td_price)
 
                 # Show each team separately
                 for _team_abbr in [_t1, _t2]:
@@ -363,13 +472,19 @@ def render_dk_projections(next_week, *, show_projector=True):
                         # Rename to drop % from display
                         if "TD/Att%" in _qb_df.columns:
                             _qb_df = _qb_df.rename(columns={"TD/Att%": "TD/Att", "INT/Att%": "INT/Att"})
-                        _qb_pass_cols = ["Player", "TD/Att", "Pass TDs", "INT/Att", "INTs", "Pass Att", "Comp", "Pass Yds", "Scrambles", "Scram Yds", "Total Rush Att", "Total Rush Yds"]
+                        # This table has no Pos column, so "TD True" (the QB's
+                        # ANYTIME-TD price, not his passing TDs) goes after Player.
+                        _qb_pass_cols = ["Player", "TD True", "TD/Att", "Pass TDs", "INT/Att", "INTs", "Pass Att", "Comp", "Pass Yds", "Scrambles", "Scram Yds", "Total Rush Att", "Total Rush Yds"]
                         _qb_pass_cols = [c for c in _qb_pass_cols if c in _qb_df.columns]
                         if _qb_pass_cols:
                             _dk_render_table(_qb_df[_qb_pass_cols].reset_index(drop=True))
 
                     # Rushing (Others at bottom)
-                    _rush_cols = ["Player", "Pos", "Rush Snp%", "Carry Rate", "Carry Share", "YPC", "Carries", "Rush Yds"]
+                    # "TD True" sits right after Pos in both player tables. It is
+                    # absent from _team_df entirely when show_projector is False
+                    # (the price is never carried through the aggregation), so the
+                    # filter below is what gates it out of the client view.
+                    _rush_cols = ["Player", "Pos", "TD True", "Rush Snp%", "Carry Rate", "Carry Share", "YPC", "Carries", "Rush Yds"]
                     _rush_cols = [c for c in _rush_cols if c in _team_df.columns]
                     # For QB rows, the Rushing line must reflect TOTAL rushing
                     # (designed + scrambles): the "Rush Yds"/"Carries" fields hold
@@ -397,7 +512,7 @@ def render_dk_projections(next_week, *, show_projector=True):
                         _dk_render_table(_rush_sorted.reset_index(drop=True))
 
                     # Receiving (Others at bottom)
-                    _rec_cols = ["Player", "Pos", "Pass Snp%", "Tgt Rate", "Tgt Share", "Catch%", "Y/Catch", "Targets", "Rec", "Rec Yds"]
+                    _rec_cols = ["Player", "Pos", "TD True", "Pass Snp%", "Tgt Rate", "Tgt Share", "Catch%", "Y/Catch", "Targets", "Rec", "Rec Yds"]
                     _rec_cols = [c for c in _rec_cols if c in _team_df.columns]
                     _rec_tbl = _team_df[_team_df["Targets"].notna() & (_team_df["Targets"] > 0)][_rec_cols] if "Targets" in _team_df.columns else pd.DataFrame()
                     if not _rec_tbl.empty:
@@ -406,4 +521,17 @@ def render_dk_projections(next_week, *, show_projector=True):
                         _rec_main = _rec_tbl[~_rec_tbl["Player"].str.contains("Others", na=False)]
                         _rec_sorted = pd.concat([_rec_main.sort_values("Rec Yds", ascending=False), _rec_others])
                         _dk_render_table(_rec_sorted.reset_index(drop=True))
+
+                    # Touchdowns. Its own table because the population differs:
+                    # bench scorers and the D/ST row have no snaps or yards.
+                    if _show_td and "TD Share" in _team_df.columns:
+                        _td_cols = [c for c in ["Player", "Pos", "TD Share", "TD True"]
+                                    if c in _team_df.columns]
+                        _td_tbl = _team_df[_team_df["TD Share"].notna()
+                                           & (_team_df["TD Share"] > 0)][_td_cols]
+                        if not _td_tbl.empty:
+                            st.caption("**Touchdowns**")
+                            _dk_render_table(
+                                _td_tbl.sort_values("TD Share", ascending=False).reset_index(drop=True)
+                            )
 

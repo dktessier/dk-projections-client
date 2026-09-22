@@ -15,7 +15,13 @@ Columns:
     saved_at | season | week | game | save_key |
     player_name | position | pass_snap_pct | tgt_rate | catch_pct | y_catch |
     rush_snap_pct | carry_rate | ypc |
-    proj_tgts | proj_rec | proj_rec_yds | proj_carries | proj_rush_yds
+    proj_tgts | proj_rec | proj_rec_yds | proj_carries | proj_rush_yds |
+    td_share_pct | td_true |
+    team_td_pts_pct | team_dst_pct | td_only
+
+New columns are APPEND-ONLY: save_projection() walks HEADERS[5:] positionally
+and _get_or_create_tab() rewrites row 1 over existing data, so inserting a
+column mid-list would relabel every historical row.
 
 Public API:
     save_projection(week, game, save_key, players) -> (success, msg)
@@ -50,6 +56,13 @@ HEADERS = [
     "proj_ints", "proj_scrambles", "proj_scramble_yds", "proj_total_rush_yds",
     "team_plays", "team_dropback_pct", "team_sack_pct", "team_throwaway_pct",
     "team_scramble_pct", "tgt_share", "carry_share",
+    # Anytime-TD pricing (fair prices, no vig). Append-only (see module docstring).
+    "td_share_pct", "td_true",
+    "team_td_pts_pct", "team_dst_pct",
+    # "1" when the player is priced for an anytime TD only (no snaps/targets/
+    # carries projected). Without this the reload cannot tell a TD-only row from
+    # a projected player who happens to sit at zero, and the row is dropped.
+    "td_only",
 ]
 
 
@@ -96,9 +109,25 @@ def _get_or_create_tab(week: int):
     import gspread
     try:
         ws = sh.worksheet(tab_name)
-        # Sync header row if columns were added
+        # Widen the grid BEFORE writing the header. values.update does not
+        # auto-expand the sheet, so writing N headers into a narrower grid
+        # fails with "tried writing to column ...". Tabs created before a
+        # column was appended are exactly this case.
+        if ws.col_count < len(HEADERS):
+            ws.resize(cols=len(HEADERS))
+        # Sync header row if columns were added. Only ever widen a tab whose header
+        # is a PREFIX of HEADERS: rewriting A1 unconditionally would relabel any
+        # column a human added to the right of the last known one, and
+        # save_projection would then write projection data into that column's cells.
+        # A mismatch is a schema problem to look at, not something to overwrite.
         existing_hdr = ws.row_values(1)
         if len(existing_hdr) < len(HEADERS):
+            if existing_hdr and existing_hdr != HEADERS[:len(existing_hdr)]:
+                raise ValueError(
+                    f"'{tab_name}' header does not match HEADERS — refusing to "
+                    f"overwrite row 1. Expected a prefix of HEADERS, found: "
+                    f"{existing_hdr}"
+                )
             ws.update(values=[HEADERS], range_name="A1")
     except gspread.WorksheetNotFound:
         ws = sh.add_worksheet(tab_name, rows=500, cols=len(HEADERS))
@@ -168,7 +197,11 @@ def load_projections(week: int) -> pd.DataFrame:
         headers = all_vals[0]
         # Clean empty headers (extra columns without names)
         headers = [h if h else f"_col_{i}" for i, h in enumerate(headers)]
-        rows = all_vals[1:]
+        # Pad/trim rows to the header width. The API trims trailing empty cells
+        # per row, so rows saved before a column was appended come back short
+        # and would otherwise raise "N columns passed, passed data had M".
+        _w = len(headers)
+        rows = [(r + [""] * _w)[:_w] for r in all_vals[1:]]
         df = pd.DataFrame(rows, columns=headers)
         # Drop empty-header columns and empty rows
         df = df[[c for c in df.columns if not c.startswith("_col_")]]
