@@ -186,8 +186,15 @@ def _load_dk_projections(week):
 
 
 def render_dk_projections(next_week, *, show_projector=True):
-    # Week selector
-    _dk_week = st.selectbox("Week", list(range(1, 19)), index=next_week - 1, key="dk_week")
+    # Week selector. int() and the clamp are both load-bearing, because this one
+    # function is the entry point for two separate apps and neither of them owns
+    # this line: a numpy scalar from a caller's parquet read fails selectbox's
+    # `isinstance(index, int)` check, and a next_week outside 1-18 (an offseason
+    # parquet, or a playoff week) fails its range check. Either one takes the whole
+    # tab down with a redacted error on Cloud, so the boundary coerces rather than
+    # trusting the caller.
+    _idx = min(max(int(next_week or 1), 1), 18) - 1
+    _dk_week = st.selectbox("Week", list(range(1, 19)), index=_idx, key="dk_week")
 
     _dk_df = _load_dk_projections(_dk_week)
 
