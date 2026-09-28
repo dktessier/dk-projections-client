@@ -17,7 +17,8 @@ Columns:
     rush_snap_pct | carry_rate | ypc |
     proj_tgts | proj_rec | proj_rec_yds | proj_carries | proj_rush_yds |
     td_share_pct | td_true |
-    team_td_pts_pct | team_dst_pct | td_only
+    team_td_pts_pct | team_dst_pct | td_only |
+    rush_td_share_pct | rec_td_share_pct | team_rush_td_pct | team_pass_td_pct
 
 New columns are APPEND-ONLY: save_projection() walks HEADERS[5:] positionally
 and _get_or_create_tab() rewrites row 1 over existing data, so inserting a
@@ -63,6 +64,12 @@ HEADERS = [
     # carries projected). Without this the reload cannot tell a TD-only row from
     # a projected player who happens to sit at zero, and the row is dropped.
     "td_only",
+    # The rush/rec split of the anytime-TD share. td_share_pct above stays the
+    # SUM of these two, so every board saved before the split still prices, and
+    # the DK output keeps reading one column. Blank on those older rows, which is
+    # how the load path tells "not split yet" from "split, and both are zero".
+    "rush_td_share_pct", "rec_td_share_pct",
+    "team_rush_td_pct", "team_pass_td_pct",
 ]
 
 

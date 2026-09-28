@@ -185,7 +185,98 @@ def _load_dk_projections(week):
     return _sheets_read(week)
 
 
-def render_dk_projections(next_week, *, show_projector=True):
+def _slate_counts(dk_df, week, slate):
+    """[(home, away, home_count, away_count)] for every game in `week`.
+
+    Starts from the SCHEDULE rather than from the saved rows, which is the whole
+    point: a matchup nobody has projected has no saved rows to be found in, so
+    counting up from the sheet can only ever list the games already done. The
+    zeroes are the signal here.
+
+    A count is distinct PROJECTORS, not distinct save_keys. A projector who also
+    saved a "Chase_Out" scenario has still only given one opinion on the game, and
+    this number is read as "how many people have looked at this".
+    """
+    if slate is None or getattr(slate, "empty", True):
+        return []
+    if not {"week", "home", "away"} <= set(slate.columns):
+        return []
+    _g = slate[slate["week"] == int(week)]
+    if _g.empty:
+        return []
+
+    # save_key is {team}_{scenario}_{projector} with the projector always last.
+    # Team -> game is 1:1 within a week, so a per-team tally is already per-game.
+    _by_team = {}
+    if dk_df is not None and not dk_df.empty and "save_key" in dk_df.columns:
+        _parts = dk_df["save_key"].dropna().astype(str).str.strip().str.split("_")
+        _by_team = (pd.DataFrame({"team": _parts.str[0], "projector": _parts.str[-1]})
+                    .drop_duplicates()
+                    .groupby("team")["projector"].nunique().to_dict())
+
+    _rows = [(str(_r.home), str(_r.away),
+              int(_by_team.get(str(_r.home), 0)), int(_by_team.get(str(_r.away), 0)))
+             for _r in _g.itertuples(index=False)]
+    # Fewest first — the list exists to say what still needs doing.
+    _rows.sort(key=lambda t: (t[2] + t[3], t[0]))
+    return _rows
+
+
+def _render_slate_summary(week, dk_df, slate):
+    """One compact line of per-team saved-projection counts for the week's slate.
+
+    Deliberately tiny and above the filters: it is a coverage check read on the way
+    past, not a table anyone works in. Red 0 / amber 1 / green 2+ per team, games
+    sorted fewest-first, so the ones to pick up next are the ones read first.
+    """
+    _rows = _slate_counts(dk_df, week, slate)
+    if not _rows:
+        return
+    _none = sum(1 for _r in _rows if _r[2] + _r[3] == 0)
+
+    def _pill(n):
+        _bg, _fg = (("#fee2e2", "#b91c1c") if n == 0 else
+                    ("#fef3c7", "#92400e") if n == 1 else
+                    ("#dcfce7", "#15803d"))
+        return (f'<span style="background:{_bg};color:{_fg};font-weight:800;'
+                f'border-radius:4px;padding:0 5px;min-width:15px;'
+                f'display:inline-block;text-align:center;">{n}</span>')
+
+    # flex:0 1 calc(12.5% - 5px) caps the row at EIGHT chips (8 x 12.5%), and
+    # min-width is what makes it responsive: once the container is too narrow to
+    # fit eight at a readable size the basis cannot be honoured, so they wrap to
+    # seven, six, and so on. A plain 8-track grid squeezed them instead of
+    # wrapping, which is what looked bad on a narrow window; free flex-wrap went
+    # the other way and gave 10 then 6.
+    #
+    # flex-grow is 0 on purpose: with grow:1 a final row holding two chips would
+    # stretch them half the page wide.
+    _chips = "".join(
+        f'<span style="display:flex;align-items:center;justify-content:center;'
+        f'flex:0 1 calc(12.5% - 5px);min-width:132px;'
+        f'gap:4px;border:1px solid #e2e8f0;border-radius:6px;padding:3px 5px;'
+        f'background:#fff;font-size:12px;color:#1a1f26;white-space:nowrap;">'
+        f'{_pill(_hc)}<b>{_h}</b><span style="color:#94a3b8;">/</span>'
+        f'<b>{_a}</b>{_pill(_ac)}</span>'
+        for _h, _a, _hc, _ac in _rows)
+
+    _hdr = (f'<span style="font-size:12px;font-weight:700;color:#475569;">'
+            f'WEEK {week} COVERAGE</span>'
+            f'<span style="font-size:12px;color:#94a3b8;"> &nbsp;'
+            f'{len(_rows) - _none} of {len(_rows)} games projected'
+            + (f' &middot; <b style="color:#b91c1c;">{_none} with none yet</b>'
+               if _none else ' &middot; all covered')
+            + '</span>')
+    # Eight per row at full width (a 16-game slate reads as 8 and 8), fewer as the
+    # window narrows. The cap and the wrapping both live on the chips themselves —
+    # see the flex basis above — so this container only has to allow wrapping.
+    st.markdown(
+        f'<div style="margin:0 0 10px 0;">{_hdr}'
+        f'<div style="display:flex;flex-wrap:wrap;gap:5px;margin-top:5px;">'
+        f'{_chips}</div></div>', unsafe_allow_html=True)
+
+
+def render_dk_projections(next_week, *, show_projector=True, slate=None):
     # Week selector. int() and the clamp are both load-bearing, because this one
     # function is the entry point for two separate apps and neither of them owns
     # this line: a numpy scalar from a caller's parquet read fails selectbox's
@@ -193,10 +284,25 @@ def render_dk_projections(next_week, *, show_projector=True):
     # parquet, or a playoff week) fails its range check. Either one takes the whole
     # tab down with a redacted error on Cloud, so the boundary coerces rather than
     # trusting the caller.
+    # Claimed before the week selector so the coverage line renders between the tab
+    # bar and the filters, which is where it was asked for. It cannot simply be
+    # written there: it needs the selected week, and that is not known until the
+    # selectbox below has run. So the slot is reserved now and filled afterwards.
+    #
+    # Trader tool only. The client view has no business seeing which of the desk's
+    # matchups are still unprojected.
+    _slate_slot = st.container() if show_projector else None
+
     _idx = min(max(int(next_week or 1), 1), 18) - 1
     _dk_week = st.selectbox("Week", list(range(1, 19)), index=_idx, key="dk_week")
 
     _dk_df = _load_dk_projections(_dk_week)
+
+    # Filled before any of the early returns below (no saves at all, or no game
+    # picked yet) — an empty week is exactly when the coverage line matters most.
+    if _slate_slot is not None:
+        with _slate_slot:
+            _render_slate_summary(_dk_week, _dk_df, slate)
 
     if not _dk_df.empty and "saved_at" in _dk_df.columns and "save_key" in _dk_df.columns and "player_name" in _dk_df.columns:
         _dk_df["saved_at"] = pd.to_datetime(_dk_df["saved_at"], errors="coerce")
