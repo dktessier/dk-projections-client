@@ -110,6 +110,28 @@ def _get_sheet():
     return gc.open_by_key(_SHEET_ID)
 
 
+def list_projection_weeks() -> list[int]:
+    """Week numbers that already have a tab, READ-ONLY.
+
+    Unlike load_projections (which routes through _get_or_create_tab and would
+    CREATE an empty 'Week N' tab as a side effect), this only reads existing
+    worksheet titles — so callers that aggregate across weeks never write empty
+    future/playoff tabs into the live sheet. Returns [] on any error.
+    """
+    import re
+    try:
+        titles = [ws.title for ws in _get_sheet().worksheets()]
+    except Exception as e:
+        logger.error(f"list_projection_weeks failed: {e}")
+        return []
+    weeks = []
+    for t in titles:
+        m = re.match(r"Week\s+(\d+)$", str(t).strip())
+        if m:
+            weeks.append(int(m.group(1)))
+    return sorted(weeks)
+
+
 def _get_or_create_tab(week: int):
     tab_name = f"Week {week}"
     sh = _get_sheet()
@@ -217,6 +239,68 @@ def load_projections(week: int) -> pd.DataFrame:
     except Exception as e:
         logger.error(f"load_projections failed: {e}")
         return pd.DataFrame()
+
+
+def load_all_projection_weeks() -> pd.DataFrame:
+    """Read EVERY existing 'Week N' tab in one batch call, READ-ONLY.
+
+    Aggregating week-by-week through load_projections is slow: each call re-opens
+    the spreadsheet and reads a tab (and routes through _get_or_create_tab, which
+    can WRITE). This fetches all week tabs in a single values_batch_get round-trip
+    and never creates or mutates a tab. Returns one DataFrame with every row plus
+    an int 'week' column, or empty on error / no tabs.
+    """
+    import re
+    if not _SHEET_ID:
+        return pd.DataFrame()
+    try:
+        sh = _get_sheet()
+        worksheets = sh.worksheets()
+    except Exception as e:
+        logger.error(f"load_all_projection_weeks (open) failed: {e}")
+        return pd.DataFrame()
+
+    week_tabs = []  # (week_int, title)
+    for ws in worksheets:
+        m = re.match(r"Week\s+(\d+)$", str(ws.title).strip())
+        if m:
+            week_tabs.append((int(m.group(1)), ws.title, ws))
+    if not week_tabs:
+        return pd.DataFrame()
+
+    # One batch call for all week tabs; fall back to per-tab reads (still a single
+    # open, no re-open per week) if the installed gspread lacks values_batch_get.
+    values_by_title = {}
+    try:
+        _resp = sh.values_batch_get([f"'{t}'" for _, t, _ in week_tabs])
+        for (_, title, _), vr in zip(week_tabs, _resp.get("valueRanges", [])):
+            values_by_title[title] = vr.get("values", [])
+    except Exception as e:
+        logger.error(f"values_batch_get failed ({e}); falling back to per-tab reads")
+        for _, title, ws in week_tabs:
+            try:
+                values_by_title[title] = ws.get_all_values()
+            except Exception:
+                values_by_title[title] = []
+
+    frames = []
+    for wk, title, _ in week_tabs:
+        vals = values_by_title.get(title) or []
+        if len(vals) < 2:
+            continue
+        headers = [h if h else f"_col_{i}" for i, h in enumerate(vals[0])]
+        _w = len(headers)
+        rows = [(r + [""] * _w)[:_w] for r in vals[1:]]
+        df = pd.DataFrame(rows, columns=headers)
+        df = df[[c for c in df.columns if not str(c).startswith("_col_")]]
+        df = df[df.iloc[:, 0] != ""]
+        if df.empty:
+            continue
+        df["week"] = wk
+        frames.append(df)
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True)
 
 
 def list_saves(week: int, game: str | None = None) -> list[dict]:
