@@ -126,6 +126,55 @@ def _equal_average(game_df, num_cols):
     )
 
 
+# ── Per-team scenario toggles ────────────────────────────────────────────────
+# Save keys encode a scenario in their middle segment ("" = Base/full health,
+# e.g. "Hall_Out" = a named injury scenario). The Saved Projections view lets a
+# trader pick a scenario PER TEAM, PER MATCHUP from the team header panel; the
+# slate-wide control just seeds the default and reads back "Custom" the moment
+# any one team diverges. These helpers are shared by both the trader and client
+# apps (render_dk_projections is the single entry point for both).
+_SCN_ALL = "All"
+_SCN_FULL = "Full Health"
+
+
+def _scn_options(scenarios):
+    """Toggle options for one team given the Scenario values it actually has.
+
+    "" is Base (full health); non-empty strings are named injury scenarios.
+      - only Base saves      -> ["Full Health"]            (nothing to toggle)
+      - Base + named          -> ["All", "Full Health", <named…>]
+      - named but no Base     -> ["All", <named…>]
+    """
+    named = sorted(s for s in scenarios if s)
+    if not named:
+        return [_SCN_FULL]
+    opts = [_SCN_ALL]
+    if "" in scenarios:
+        opts.append(_SCN_FULL)
+    return opts + named
+
+
+def _scn_fallback(opts, base):
+    """The selection a team lands on when it can't honor the slate default
+    (e.g. slate=All but a team only has Base saves). A forced fallback, so it
+    deliberately does NOT count as a user override for the "Custom" indicator."""
+    if base in opts:
+        return base
+    if _SCN_FULL in opts:
+        return _SCN_FULL
+    return opts[0]
+
+
+def _scn_filter(df, selected):
+    """Rows for the selected scenario: All = everything, Full Health = Base only,
+    otherwise the single named scenario."""
+    if selected == _SCN_ALL:
+        return df
+    if selected == _SCN_FULL:
+        return df[df["Scenario"] == ""]
+    return df[df["Scenario"] == selected]
+
+
 def _weighted_display_df(game_df, num_cols, wt_df):
     """Per-player display frame using a projector-weight matrix (team x projector,
     0-1). Falls back to an equal average per team wherever weights are empty or
@@ -381,16 +430,9 @@ def render_dk_projections(next_week, *, show_projector=True, slate=None):
             # which defaults to an equal average wherever weights are unset.
             _dk_projector = "__CLIENT_WEIGHTED__"
 
-        # Scenario filter — only show if there are projections with players out
-        _all_scenarios = sorted(_dk_filt["Scenario"].unique().tolist()) if "Scenario" in _dk_filt.columns else []
-        _all_scenarios = [s for s in _all_scenarios if s]  # remove empty (base projections)
-        if _all_scenarios:
-            _dk_f3 = st.columns([1])[0]
-            _dk_scenario = _dk_f3.selectbox("Scenario", ["Base (Full Health)"] + _all_scenarios, key="dk_scenario_filter")
-            if _dk_scenario == "Base (Full Health)":
-                _dk_filt = _dk_filt[_dk_filt["Scenario"] == ""]
-            else:
-                _dk_filt = _dk_filt[_dk_filt["Scenario"] == _dk_scenario]
+        # Scenario is no longer filtered slate-wide here — it's chosen per team,
+        # per matchup from each team's header panel (see the slate control and the
+        # per-team toggles below). _dk_filt keeps every scenario's rows.
 
         # Convert numeric columns
         _num_cols = ["pass_snap_pct", "tgt_rate", "catch_pct", "y_catch",
@@ -431,6 +473,58 @@ def render_dk_projections(next_week, *, show_projector=True, slate=None):
         else:
             _games_to_render = sorted(_dk_filt["game_clean"].dropna().unique().tolist())
 
+        # Scenario toggle options per (game, team), driven by the save keys that
+        # team actually has. Computed once so the slate control and the per-team
+        # toggles below agree on the option set.
+        def _scn_key(game_clean, team_abbr):
+            return f"dk_scn_{_dk_week}_{game_clean}_{team_abbr}"
+
+        _team_scn_opts = {}
+        for _g in _games_to_render:
+            _gdf = _dk_filt[_dk_filt["game_clean"] == _g]
+            _gt = _g.replace("vs.", "").split()
+            for _ta in [(_gt[0].strip() if _gt else ""),
+                        (_gt[-1].strip() if len(_gt) > 1 else "")]:
+                if not _ta:
+                    continue
+                _scns = (set(_gdf[_gdf["_team"] == _ta]["Scenario"].unique())
+                         if "Scenario" in _gdf.columns else set())
+                _team_scn_opts[(_g, _ta)] = _scn_options(_scns)
+
+        # Slate-wide scenario default. Only surfaced when at least one team has a
+        # named (non-base) scenario — otherwise every team is Full Health and
+        # there is nothing to pick. Shows "Custom" when any team diverges;
+        # re-picking All or Full Health resets every team to that choice.
+        _has_named = any(len(_o) > 1 for _o in _team_scn_opts.values())
+        if _has_named:
+            _slate_base = st.session_state.get("dk_scn_base", _SCN_FULL)
+            _is_custom = any(
+                st.session_state.get(_scn_key(_g, _t), _scn_fallback(_o, _slate_base))
+                != _scn_fallback(_o, _slate_base)
+                for (_g, _t), _o in _team_scn_opts.items()
+            )
+            # Set before the widget is instantiated so the selectbox adopts it.
+            st.session_state["dk_scn_slate"] = "Custom" if _is_custom else _slate_base
+
+            def _on_slate_change():
+                _v = st.session_state.get("dk_scn_slate")
+                if _v in (_SCN_ALL, _SCN_FULL):
+                    st.session_state["dk_scn_base"] = _v
+                    for (_g, _t), _o in _team_scn_opts.items():
+                        st.session_state[_scn_key(_g, _t)] = _scn_fallback(_o, _v)
+                # A manual "Custom" pick is a no-op — the next run recomputes the
+                # indicator from the per-team toggles.
+
+            st.columns([1])[0].selectbox(
+                "Scenario (slate default)",
+                [_SCN_ALL, _SCN_FULL, "Custom"],
+                key="dk_scn_slate",
+                on_change=_on_slate_change,
+                help="Default scenario applied to every team. Change a single "
+                     "team's scenario on its header below and this reads "
+                     "“Custom”; re-pick All or Full Health to reset every team.",
+            )
+
         if _games_to_render:
             import streamlit.components.v1 as _stc
             _dk_css = '<style>.dk-tbl table{border-collapse:collapse;width:100%;font-family:-apple-system,sans-serif;}.dk-tbl th{padding:6px 8px;font-size:13px;font-weight:800;color:#1a1f26;border-bottom:2px solid #bbb;text-align:center;}.dk-tbl td{padding:6px 8px;border-bottom:1px solid #e8e8e8;font-size:14px;font-weight:500;color:#1a1f26;text-align:center;}.dk-tbl td:first-child,.dk-tbl th:first-child{text-align:left;}</style>'
@@ -449,22 +543,72 @@ def render_dk_projections(next_week, *, show_projector=True, slate=None):
                 html = styled.to_html()
                 _stc.html(f'<html><head>{_dk_css}</head><body><div class="dk-tbl">{html}</div></body></html>', height=52 + len(tbl_df) * 32, scrolling=True)
 
-            # Per-team saved-projection count (trader tool only). Counts the
-            # distinct save_keys for a team under the active Game + Scenario
-            # filters — i.e. how many projectors have submitted for that team.
-            # Only shown under the 'Average' view: a specific projector implies
-            # a single projection, so no badge is shown for that selection.
-            def _saved_count(game_clean, team_abbr):
-                if not (show_projector and _dk_projector == "Average"):
-                    return None
-                if "save_key" not in _dk_filt.columns:
-                    return 0
-                _sub = _dk_filt[(_dk_filt["game_clean"] == game_clean)
-                                & (_dk_filt["_team"] == team_abbr)]
-                return int(_sub["save_key"].nunique())
+            # Projector weights loaded once per render (not per team/scenario).
+            _wt_df = None
+            if _dk_projector == "__CLIENT_WEIGHTED__":
+                # Client view: client weights sheet (equal average where unset).
+                from sheets import load_client_projector_weights
+                _wt_df = load_client_projector_weights()
+            elif _dk_projector == "Average":
+                # Trader view: trader weights sheet.
+                from sheets import load_projector_weights
+                _wt_df = load_projector_weights()
 
-            _games_to_show = _games_to_render
-            for _game in _games_to_show:
+            _RENAME = {
+                "player_name": "Player", "position": "Pos",
+                "pass_snap_pct": "Pass Snp%", "tgt_rate": "Tgt Rate",
+                "catch_pct": "Catch%", "y_catch": "Y/Catch",
+                "rush_snap_pct": "Rush Snp%", "carry_rate": "Carry Rate",
+                "ypc": "YPC",
+                "proj_tgts": "Targets", "proj_rec": "Rec",
+                "proj_rec_yds": "Rec Yds", "proj_carries": "Carries",
+                "proj_rush_yds": "Rush Yds",
+                "proj_pass_att": "Pass Att", "proj_comp": "Comp",
+                "proj_pass_yds": "Pass Yds", "proj_pass_tds": "Pass TDs",
+                "proj_ints": "INTs", "proj_scrambles": "Scrambles",
+                "proj_scramble_yds": "Scram Yds", "proj_total_rush_yds": "Total Rush Yds",
+                "qb_td_att_pct": "TD/Att%", "qb_int_att_pct": "INT/Att%",
+                "team_plays": "Plays", "team_dropback_pct": "Dropback%",
+                "team_sack_pct": "Sack%", "team_throwaway_pct": "Throwaway%",
+                "team_scramble_pct": "Scramble%",
+                "tgt_share": "Tgt Share", "carry_share": "Carry Share",
+                "td_share_pct": "TD Share", "td_true": "TD True",
+            }
+
+            def _build_disp(_src):
+                """Aggregate one team's scenario-filtered rows into the display
+                frame — weighted/equal (Average, client) or a single projector —
+                then restore TD prices, rename, and format. Empty when there's
+                nothing to show. Scenario filtering happens BEFORE this, so under
+                'All' every saved row (base + injury) is blended as-is."""
+                if _src is None or _src.empty:
+                    return pd.DataFrame()
+                if _dk_projector in ("__CLIENT_WEIGHTED__", "Average"):
+                    _d = _weighted_display_df(_src, _num_cols, _wt_df)
+                else:
+                    _pf = _src[_src.Projector == _dk_projector]
+                    if _pf.empty:
+                        return pd.DataFrame()
+                    _d = _round_disp(
+                        _pf[["player_name", "position", "_team"]
+                            + [c for c in _num_cols if c in _pf.columns]].copy()
+                    ).reset_index(drop=True)
+                # Probabilities -> prices. Must run after aggregation, never before.
+                _d = _restore_td_prices(_d)
+                _d = _d.rename(columns=_RENAME)
+                # Others rows: show N/A for snap%/rate columns.
+                _is_others = _d["Player"].str.contains("Others", na=False)
+                if _is_others.any():
+                    for _na_col in ["Pass Snp%", "Tgt Rate", "Rush Snp%", "Carry Rate"]:
+                        if _na_col in _d.columns:
+                            _d[_na_col] = _d[_na_col].astype(object)
+                            _d.loc[_is_others, _na_col] = "N/A"
+                # Signed TD-True so the column reads as odds ("+580", not "580").
+                if "TD True" in _d.columns:
+                    _d["TD True"] = _d["TD True"].map(_fmt_td_price)
+                return _d
+
+            for _game in _games_to_render:
                 _game_df = _dk_filt[_dk_filt.game_clean == _game]
                 if _game_df.empty:
                     continue
@@ -474,76 +618,30 @@ def render_dk_projections(next_week, *, show_projector=True, slate=None):
                 _t1 = _game_teams[0].strip() if len(_game_teams) > 0 else ""
                 _t2 = _game_teams[-1].strip() if len(_game_teams) > 1 else ""
 
-                # Build display data
-                if _dk_projector == "__CLIENT_WEIGHTED__":
-                    # Client view: weighted by the client weights sheet (equal
-                    # average where unset). Never reads the trader weights.
-                    from sheets import load_client_projector_weights
-                    _disp_df = _weighted_display_df(_game_df, _num_cols, load_client_projector_weights())
-                elif _dk_projector == "Average":
-                    # Trader view: weighted average using the trader weights sheet.
-                    from sheets import load_projector_weights
-                    _disp_df = _weighted_display_df(_game_df, _num_cols, load_projector_weights())
-                else:
-                    _proj_df = _game_df[_game_df.Projector == _dk_projector]
-                    if _proj_df.empty:
-                        continue
-                    _disp_df = _round_disp(
-                        _proj_df[["player_name", "position", "_team"]
-                                 + [c for c in _num_cols if c in _proj_df.columns]].copy()
-                    ).reset_index(drop=True)
-
-                # Probabilities -> prices. Must run after aggregation, never before.
-                _disp_df = _restore_td_prices(_disp_df)
-
-                # Rename
-                _disp_df = _disp_df.rename(columns={
-                    "player_name": "Player", "position": "Pos",
-                    "pass_snap_pct": "Pass Snp%", "tgt_rate": "Tgt Rate",
-                    "catch_pct": "Catch%", "y_catch": "Y/Catch",
-                    "rush_snap_pct": "Rush Snp%", "carry_rate": "Carry Rate",
-                    "ypc": "YPC",
-                    "proj_tgts": "Targets", "proj_rec": "Rec",
-                    "proj_rec_yds": "Rec Yds", "proj_carries": "Carries",
-                    "proj_rush_yds": "Rush Yds",
-                    "proj_pass_att": "Pass Att", "proj_comp": "Comp",
-                    "proj_pass_yds": "Pass Yds", "proj_pass_tds": "Pass TDs",
-                    "proj_ints": "INTs", "proj_scrambles": "Scrambles",
-                    "proj_scramble_yds": "Scram Yds", "proj_total_rush_yds": "Total Rush Yds",
-                    "qb_td_att_pct": "TD/Att%", "qb_int_att_pct": "INT/Att%",
-                    "team_plays": "Plays", "team_dropback_pct": "Dropback%",
-                    "team_sack_pct": "Sack%", "team_throwaway_pct": "Throwaway%",
-                    "team_scramble_pct": "Scramble%",
-                    "tgt_share": "Tgt Share", "carry_share": "Carry Share",
-                    "td_share_pct": "TD Share", "td_true": "TD True",
-                })
-
-                # For Others rows: show N/A for snap%/rate columns
-                _is_others = _disp_df["Player"].str.contains("Others", na=False)
-                if _is_others.any():
-                    for _na_col in ["Pass Snp%", "Tgt Rate", "Rush Snp%", "Carry Rate"]:
-                        if _na_col in _disp_df.columns:
-                            _disp_df[_na_col] = _disp_df[_na_col].astype(object)
-                            _disp_df.loc[_is_others, _na_col] = "N/A"
-
-                # Print TD True with an explicit sign so the column reads as odds
-                # next to a closing line ("+580", not "580"). Done once here, on
-                # the display frame only, so all three tables pick it up — the
-                # saved value and _restore_td_prices stay numeric.
-                if "TD True" in _disp_df.columns:
-                    _disp_df["TD True"] = _disp_df["TD True"].map(_fmt_td_price)
-
-                # Show each team separately
+                # Each team picks its own scenario (All / Full Health / a named
+                # injury scenario) from its header, so filtering + aggregation is
+                # per team, not once per game.
                 for _team_abbr in [_t1, _t2]:
                     if not _team_abbr:
                         continue
-                    _team_df = _disp_df[_disp_df["_team"] == _team_abbr]
-                    # Under the 'Average' view we always render both teams' headers
-                    # (with the saved-projection count) so a team with no saves
-                    # still shows a 0. For a specific projector / client view,
-                    # keep the original behavior of skipping empty teams.
+                    _team_all = _game_df[_game_df["_team"] == _team_abbr]
+                    _opts = _team_scn_opts.get(
+                        (_game, _team_abbr),
+                        _scn_options(set(_team_all["Scenario"].unique())
+                                     if "Scenario" in _team_all.columns else set()))
+                    _slate_base = st.session_state.get("dk_scn_base", _SCN_FULL)
+                    _scn_default = _scn_fallback(_opts, _slate_base)
+                    _skey = _scn_key(_game, _team_abbr)
+                    _selected = st.session_state.get(_skey, _scn_default)
+                    if _selected not in _opts:
+                        _selected = _scn_default
+                    _team_src = _scn_filter(_team_all, _selected)
+                    _team_df = _build_disp(_team_src)
+
+                    # Under 'Average' we always render both teams' headers (with a
+                    # 0 count if need be); otherwise skip a team with nothing to show.
                     _show_count = show_projector and _dk_projector == "Average"
-                    if _team_df.empty and not _show_count:
+                    if (_team_df is None or _team_df.empty) and not _show_count:
                         continue
 
                     # Team header
@@ -552,13 +650,13 @@ def render_dk_projections(next_week, *, show_projector=True, slate=None):
                     _tname = get_team_name(_team_abbr)
                     _hdr = f'<img src="data:image/png;base64,{_tlogo}" style="width:32px;height:32px;margin-right:10px;"/>' if _tlogo else ""
                     _hdr += f'<span style="font-size:22px;font-weight:800;color:{_tcolor};">{_tname}</span>'
-                    _cnt = _saved_count(_game, _team_abbr)
                     _cnt_html = ""
-                    if _cnt is not None:
+                    if _show_count:
+                        _cnt = int(_team_src["save_key"].nunique()) if "save_key" in _team_src.columns else 0
                         _cnt_label = "saved projection" if _cnt == 1 else "saved projections"
                         _cnt_html = (
-                            f'<span title="Number of projectors who have saved a '
-                            f'projection for this team under the selected scenario" '
+                            f'<span title="Saved projections for this team under the '
+                            f'selected scenario" '
                             f'style="margin-left:auto;font-size:14px;font-weight:700;'
                             f'color:{_tcolor};background:{_tcolor}1a;'
                             f'border:1px solid {_tcolor}55;padding:2px 14px;'
@@ -566,6 +664,15 @@ def render_dk_projections(next_week, *, show_projector=True, slate=None):
                             f'<b style="font-size:16px;">{_cnt}</b> {_cnt_label}</span>'
                         )
                     st.markdown(f'<div style="display:flex;align-items:center;margin:20px 0 6px 0;padding:8px 0;border-bottom:2px solid {_tcolor}40;">{_hdr}{_cnt_html}</div>', unsafe_allow_html=True)
+
+                    # Per-team scenario toggle. Only drawn when the team has a real
+                    # choice; a base-only team just notes it's Full Health (shown
+                    # only when the slate has scenarios in play at all).
+                    if len(_opts) > 1:
+                        st.radio("Scenario", _opts, index=_opts.index(_selected),
+                                 key=_skey, horizontal=True, label_visibility="collapsed")
+                    elif _has_named:
+                        st.caption("Scenario: Full Health")
 
                     # Team Volume (show once per team)
                     _tv_cols = ["Plays", "Dropback%", "Sack%", "Throwaway%", "Scramble%"]
