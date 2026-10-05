@@ -100,6 +100,9 @@ _NAME_DISPLAY_OVERRIDES = {
     "luther burden": "Luther Burden III",
     "aj barner": "A.J. Barner",
     "dj moore": "D.J. Moore",
+    # Ourlads spells him "Tre' Harris"; the model's data and the board say "Tre
+    # Harris". Without this the longest-name tie-break picks the apostrophe.
+    "tre harris": "Tre Harris",
 }
 
 
@@ -107,7 +110,9 @@ def _canon_player_name(n) -> str:
     # Match ignoring generational suffix, periods (AJ vs A.J.), case, and
     # extra whitespace, so spelling variants of one player collapse together.
     s = _NAME_SUFFIX_RE.sub("", str(n).strip())
-    s = s.replace(".", "")
+    # Apostrophes too: "Tre' Harris" and "Tre Harris" are one player, saved under
+    # two spellings by boards built off different roster sources.
+    s = s.replace(".", "").replace("'", "").replace("\u2019", "")
     return _re.sub(r"\s+", " ", s).strip().lower()
 
 
@@ -271,12 +276,23 @@ def _slate_counts(dk_df, week, slate):
     return _rows
 
 
-def _render_slate_summary(week, dk_df, slate):
-    """One compact line of per-team saved-projection counts for the week's slate.
+def _open_game(home, away):
+    """Chip callback: queue a game for the Game dropdown below.
 
-    Deliberately tiny and above the filters: it is a coverage check read on the way
-    past, not a table anyone works in. Red 0 / amber 1 / green 2+ per team, games
-    sorted fewest-first, so the ones to pick up next are the ones read first.
+    Queued rather than written straight into dk_game_filter because the label has
+    to match one of that selectbox's options exactly, and those are only known
+    once render_dk_projections has read the week's saves.
+    """
+    st.session_state["_dk_pending_game"] = (home, away)
+
+
+def _render_slate_summary(week, dk_df, slate):
+    """One compact block of per-team saved-projection counts for the week's slate.
+
+    Deliberately small and above the filters: it is a coverage check read on the
+    way past. Red 0 / amber 1 / green 2+ per team, games sorted fewest-first, so
+    the ones to pick up next are the ones read first. Each chip is a button that
+    opens that game in the board below.
     """
     _rows = _slate_counts(dk_df, week, slate)
     if not _rows:
@@ -284,30 +300,8 @@ def _render_slate_summary(week, dk_df, slate):
     _none = sum(1 for _r in _rows if _r[2] + _r[3] == 0)
 
     def _pill(n):
-        _bg, _fg = (("#fee2e2", "#b91c1c") if n == 0 else
-                    ("#fef3c7", "#92400e") if n == 1 else
-                    ("#dcfce7", "#15803d"))
-        return (f'<span style="background:{_bg};color:{_fg};font-weight:800;'
-                f'border-radius:4px;padding:0 5px;min-width:15px;'
-                f'display:inline-block;text-align:center;">{n}</span>')
-
-    # flex:0 1 calc(12.5% - 5px) caps the row at EIGHT chips (8 x 12.5%), and
-    # min-width is what makes it responsive: once the container is too narrow to
-    # fit eight at a readable size the basis cannot be honoured, so they wrap to
-    # seven, six, and so on. A plain 8-track grid squeezed them instead of
-    # wrapping, which is what looked bad on a narrow window; free flex-wrap went
-    # the other way and gave 10 then 6.
-    #
-    # flex-grow is 0 on purpose: with grow:1 a final row holding two chips would
-    # stretch them half the page wide.
-    _chips = "".join(
-        f'<span style="display:flex;align-items:center;justify-content:center;'
-        f'flex:0 1 calc(12.5% - 5px);min-width:132px;'
-        f'gap:4px;border:1px solid #e2e8f0;border-radius:6px;padding:3px 5px;'
-        f'background:#fff;font-size:12px;color:#1a1f26;white-space:nowrap;">'
-        f'{_pill(_hc)}<b>{_h}</b><span style="color:#94a3b8;">/</span>'
-        f'<b>{_a}</b>{_pill(_ac)}</span>'
-        for _h, _a, _hc, _ac in _rows)
+        _c = "red" if n == 0 else "orange" if n == 1 else "green"
+        return f":{_c}-background[**{n}**]"
 
     _hdr = (f'<span style="font-size:12px;font-weight:700;color:#475569;">'
             f'WEEK {week} COVERAGE</span>'
@@ -316,13 +310,18 @@ def _render_slate_summary(week, dk_df, slate):
             + (f' &middot; <b style="color:#b91c1c;">{_none} with none yet</b>'
                if _none else ' &middot; all covered')
             + '</span>')
-    # Eight per row at full width (a 16-game slate reads as 8 and 8), fewer as the
-    # window narrows. The cap and the wrapping both live on the chips themselves —
-    # see the flex basis above — so this container only has to allow wrapping.
-    st.markdown(
-        f'<div style="margin:0 0 10px 0;">{_hdr}'
-        f'<div style="display:flex;flex-wrap:wrap;gap:5px;margin-top:5px;">'
-        f'{_chips}</div></div>', unsafe_allow_html=True)
+    st.markdown(_hdr, unsafe_allow_html=True)
+
+    # Eight to a row, so a 16-game slate reads as 8 and 8. Real st.buttons rather
+    # than HTML so a click can reach Python; sixteen buttons are a few KB of state,
+    # nothing like the cost of the tables they open.
+    _PER_ROW = 8
+    for _i in range(0, len(_rows), _PER_ROW):
+        _cols = st.columns(_PER_ROW)
+        for _col, (_h, _a, _hc, _ac) in zip(_cols, _rows[_i:_i + _PER_ROW]):
+            _col.button(f"{_pill(_hc)} {_h} / {_a} {_pill(_ac)}",
+                        key=f"dk_slate_{week}_{_h}_{_a}",
+                        on_click=_open_game, args=(_h, _a))
 
 
 def render_dk_projections(next_week, *, show_projector=True, slate=None):
@@ -346,6 +345,17 @@ def render_dk_projections(next_week, *, show_projector=True, slate=None):
     _dk_week = st.selectbox("Week", list(range(1, 19)), index=_idx, key="dk_week")
 
     _dk_df = _load_dk_projections(_dk_week)
+
+    # Taken off the queue on EVERY run, before any early return: left in place on a
+    # week with no saves (where the Game box below never renders), it would sit
+    # there and be applied to whatever week next has saves — the wrong game.
+    _pend = st.session_state.pop("_dk_pending_game", None)
+    # Matchup labels on this week's slate, in both orders. A chip-opened game with
+    # no saves is only kept selectable while it is still on the week being viewed.
+    _slate_games = set()
+    if slate is not None and not getattr(slate, "empty", True) and             {"week", "home", "away"} <= set(slate.columns):
+        for _sr in slate[slate["week"] == int(_dk_week)].itertuples(index=False):
+            _slate_games |= {f"{_sr.home} vs. {_sr.away}", f"{_sr.away} vs. {_sr.home}"}
 
     # Filled before any of the early returns below (no saves at all, or no game
     # picked yet) — an empty week is exactly when the coverage line matters most.
@@ -406,6 +416,28 @@ def render_dk_projections(next_week, *, show_projector=True, slate=None):
             _dk_f1 = st.columns([1])[0]
         with _dk_f1:
             _all_games = sorted(_dk_df["game_clean"].dropna().unique().tolist()) if "game_clean" in _dk_df.columns else []
+            # A slate chip was clicked. Saved labels are "HOME vs. AWAY" off the
+            # odds feed, so try both orders before minting one. A game nobody has
+            # saved yet is added as an option so the click still lands — the board
+            # renders a chosen matchup even at zero saves, which is what shows the
+            # trader it still needs doing.
+            if _pend:
+                _ph, _pa = _pend
+                _lbl = next((g for g in (f"{_ph} vs. {_pa}", f"{_pa} vs. {_ph}")
+                             if g in _all_games), f"{_ph} vs. {_pa}")
+                if _lbl not in _all_games:
+                    _all_games = sorted(_all_games + [_lbl])
+                st.session_state["dk_game_filter"] = _lbl
+            else:
+                # Keep a chip-opened zero-save game selectable on later reruns —
+                # but only while it is on THIS week's slate. Without that check a
+                # game picked in week 3 was added to week 4's list after a week
+                # switch and stayed selected, rendering a matchup not on the slate
+                # (Streamlit would otherwise have reset the stale value itself).
+                _cur = st.session_state.get("dk_game_filter")
+                if (_cur and _cur != "All Games" and _cur not in _all_games
+                        and _cur in _slate_games):
+                    _all_games = sorted(_all_games + [_cur])
             _dk_game = st.selectbox("Game", ["All Games"] + _all_games, index=None,
                                     placeholder="Select a game…", key="dk_game_filter")
 
