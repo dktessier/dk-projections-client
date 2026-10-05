@@ -13,7 +13,7 @@ import streamlit as st
 import streamlit.components.v1 as _stc
 
 from team_meta import get_team_color, get_team_name, get_team_logo_path
-from sheets import load_projections as _sheets_read, load_projector_weights
+from sheets import load_projections as _sheets_read
 
 # Odds conversions, duplicated from core.math on purpose: this module is synced
 # into the PUBLIC client repo (deploy/sync-from-private.yml), which ships only
@@ -239,6 +239,54 @@ def _load_dk_projections(week):
     return _sheets_read(week)
 
 
+# The weights matrices were read from Google on EVERY rerun with a game open —
+# two round trips each (open + read), paid again on every scenario toggle,
+# projector change and slate-chip click. They are edited by hand a few times a
+# season, so five minutes of staleness is invisible and the reruns stop waiting
+# on the network.
+#
+# Only a GOOD read is cached. sheets._load_weights_matrix turns any failure (a
+# 429, a timeout, a token refresh) into an empty frame, and cache_data would keep
+# that for the full five minutes — silently pricing the Average and client views
+# as a plain equal average. So an empty result raises inside the cached function,
+# which cache_data does not store, and the caller falls back to equal weights for
+# that one rerun only; the next rerun asks Google again, exactly as before.
+class _NoWeights(Exception):
+    pass
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _cached_trader_weights():
+    from sheets import load_projector_weights
+    _w = load_projector_weights()
+    if _w is None or _w.empty:
+        raise _NoWeights()
+    return _w
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _cached_client_weights():
+    from sheets import load_client_projector_weights
+    _w = load_client_projector_weights()
+    if _w is None or _w.empty:
+        raise _NoWeights()
+    return _w
+
+
+def _load_trader_weights():
+    try:
+        return _cached_trader_weights()
+    except _NoWeights:
+        return pd.DataFrame()
+
+
+def _load_client_weights():
+    try:
+        return _cached_client_weights()
+    except _NoWeights:
+        return pd.DataFrame()
+
+
 def _slate_counts(dk_df, week, slate):
     """[(home, away, home_count, away_count)] for every game in `week`.
 
@@ -376,7 +424,14 @@ def render_dk_projections(next_week, *, show_projector=True, slate=None):
                         .reset_index(drop=True))
 
     if _dk_df.empty:
-        st.info(f"No projections saved for Week {_dk_week} yet.")
+        # A chip clicked on a week nobody has saved into: there is no board to
+        # open, so say which game and why rather than doing nothing — silence
+        # read as a broken button.
+        if _pend:
+            st.info(f"Nobody has saved {_pend[0]} vs. {_pend[1]} for Week {_dk_week} yet "
+                    f"— no saved projections this week at all.")
+        else:
+            st.info(f"No projections saved for Week {_dk_week} yet.")
     else:
         # Parse save_key: {team}_{scenario}_{projector} or {team}_{projector}
         # Projector is always the last segment after final "_"
@@ -579,12 +634,10 @@ def render_dk_projections(next_week, *, show_projector=True, slate=None):
             _wt_df = None
             if _dk_projector == "__CLIENT_WEIGHTED__":
                 # Client view: client weights sheet (equal average where unset).
-                from sheets import load_client_projector_weights
-                _wt_df = load_client_projector_weights()
+                _wt_df = _load_client_weights()
             elif _dk_projector == "Average":
                 # Trader view: trader weights sheet.
-                from sheets import load_projector_weights
-                _wt_df = load_projector_weights()
+                _wt_df = _load_trader_weights()
 
             _RENAME = {
                 "player_name": "Player", "position": "Pos",
@@ -705,6 +758,17 @@ def render_dk_projections(next_week, *, show_projector=True, slate=None):
                                  key=_skey, horizontal=True, label_visibility="collapsed")
                     elif _has_named:
                         st.caption("Scenario: Full Health")
+
+                    # A team nobody has saved still gets its header and its "0"
+                    # badge above — that is the point under Average — but there is
+                    # nothing to tabulate. _build_disp on zero rows returns a frame
+                    # with NO columns, so the tables below raised KeyError 'Pos' and
+                    # took down every game where only one side had been projected:
+                    # the common mid-week case, whether opened from the Game box or
+                    # a slate chip.
+                    if _team_df is None or _team_df.empty or "Pos" not in _team_df.columns:
+                        st.caption("No saved projections for this team yet.")
+                        continue
 
                     # Team Volume (show once per team)
                     _tv_cols = ["Plays", "Dropback%", "Sack%", "Throwaway%", "Scramble%"]

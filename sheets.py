@@ -105,9 +105,21 @@ def _get_gc():
     return _gc
 
 
+_sheet = None
+
+
 def _get_sheet():
-    gc = _get_gc()
-    return gc.open_by_key(_SHEET_ID)
+    """The projections spreadsheet, opened once per process.
+
+    open_by_key is a network round trip, and it used to run on every single read
+    and save. The handle is only an id plus the authorised client, so it does not
+    go stale: sh.worksheet() re-fetches the tab list itself on every call, which
+    is why a tab added by another session is still found.
+    """
+    global _sheet
+    if _sheet is None:
+        _sheet = _get_gc().open_by_key(_SHEET_ID)
+    return _sheet
 
 
 def list_projection_weeks() -> list[int]:
@@ -218,7 +230,17 @@ def load_projections(week: int) -> pd.DataFrame:
     if not _SHEET_ID:
         return pd.DataFrame()
     try:
-        ws = _get_or_create_tab(week)
+        # READ-ONLY lookup, not _get_or_create_tab. That helper is for saving: it
+        # widens the grid and checks/repairs the header row, which is one to three
+        # extra round trips on every read, and it CREATES an empty "Week N" tab
+        # when there is none — so merely viewing a future week wrote a tab into
+        # the live sheet. Saving still goes through it, so a tab is still
+        # created, widened and re-headed the moment anyone saves into it.
+        import gspread
+        try:
+            ws = _get_sheet().worksheet(f"Week {week}")
+        except gspread.WorksheetNotFound:
+            return pd.DataFrame(columns=HEADERS)
         # Use get_all_values to avoid duplicate header issues
         all_vals = ws.get_all_values()
         if not all_vals or len(all_vals) < 2:
