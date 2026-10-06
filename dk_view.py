@@ -345,7 +345,12 @@ def _render_slate_summary(week, dk_df, slate):
     _rows = _slate_counts(dk_df, week, slate)
     if not _rows:
         return
-    _none = sum(1 for _r in _rows if _r[2] + _r[3] == 0)
+    # Counted by TEAM, not by game: a game with only the home side projected is
+    # half-covered, and reporting it as a projected "game" overstates how far
+    # along the slate is. Each row is one game = two teams.
+    _teams = len(_rows) * 2
+    _covered = sum((1 if _r[2] else 0) + (1 if _r[3] else 0) for _r in _rows)
+    _none = _teams - _covered
 
     def _pill(n):
         _c = "red" if n == 0 else "orange" if n == 1 else "green"
@@ -354,7 +359,7 @@ def _render_slate_summary(week, dk_df, slate):
     _hdr = (f'<span style="font-size:12px;font-weight:700;color:#475569;">'
             f'WEEK {week} COVERAGE</span>'
             f'<span style="font-size:12px;color:#94a3b8;"> &nbsp;'
-            f'{len(_rows) - _none} of {len(_rows)} games projected'
+            f'{_covered} of {_teams} teams projected'
             + (f' &middot; <b style="color:#b91c1c;">{_none} with none yet</b>'
                if _none else ' &middot; all covered')
             + '</span>')
