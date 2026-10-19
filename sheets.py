@@ -33,6 +33,8 @@ Public API:
 from __future__ import annotations
 
 import logging
+import math
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -70,6 +72,10 @@ HEADERS = [
     # how the load path tells "not split yet" from "split, and both are zero".
     "rush_td_share_pct", "rec_td_share_pct",
     "team_rush_td_pct", "team_pass_td_pct",
+    # td_true with the desk's margin applied — the number compared to market
+    # prices. Computed at save time from the 'TD Margin' tab's curve (see
+    # td_margin_price); blank wherever td_true is blank.
+    "td_margin",
 ]
 
 
@@ -212,8 +218,17 @@ def save_projection(
                     ws.delete_rows(rn)
 
         now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        # td_margin is derived here, from the row's own td_true, so every save
+        # path gets it without the caller knowing about it. The curve is read
+        # only when something on the board is priced, and an unreadable curve
+        # leaves the margin cells blank rather than failing the save.
+        _margins = (load_td_margin_table()
+                    if any(p.get("td_true") not in (None, "") for p in players) else [])
         rows = []
         for p in players:
+            if "td_margin" not in p:
+                _mp = td_margin_price(p.get("td_true"), _margins)
+                p = {**p, "td_margin": "" if _mp is None else _mp}
             row = [now, season, week, game, save_key]
             for h in HEADERS[5:]:
                 row.append(p.get(h, ""))
@@ -223,6 +238,90 @@ def save_projection(
     except Exception as e:
         logger.error(f"save_projection failed: {e}")
         return False, str(e)
+
+
+# ── TD margin ────────────────────────────────────────────────────────────────
+# The desk's margin curve lives on the 'TD Margin' tab of the projections
+# spreadsheet: win probabilities in A2:A102 (0.00 .. 1.00 by 0.01) and the margin
+# to ADD to each in D2:D102. It is read live rather than copied into code so that
+# a desk edit to the curve takes effect on the next save with no deploy, and it is
+# read UNFORMATTED: the tab displays margins to 2dp (3.48%) but holds them at full
+# precision, and the 2dp copy reproduces only ~74% of the sheet's own margined
+# prices exactly (misses up to 35 cents on long prices).
+TD_MARGIN_TAB = "TD Margin"
+_MARGIN_TTL_S = 300
+_margin_cache: tuple[float, list[tuple[float, float]]] | None = None
+
+
+def load_td_margin_table() -> list[tuple[float, float]]:
+    """[(probability, margin)] sorted by probability, or [] if unreadable.
+
+    Cached for five minutes per process. A failed read is NOT cached, so one
+    Google hiccup costs one save its margins rather than every save for five
+    minutes.
+    """
+    global _margin_cache
+    now = time.time()
+    if _margin_cache and now - _margin_cache[0] < _MARGIN_TTL_S:
+        return _margin_cache[1]
+    try:
+        ws = _get_sheet().worksheet(TD_MARGIN_TAB)
+        probs = ws.get("A2:A102", value_render_option="UNFORMATTED_VALUE")
+        margins = ws.get("D2:D102", value_render_option="UNFORMATTED_VALUE")
+        table = []
+        for pr, mg in zip(probs, margins):
+            try:
+                table.append((float(pr[0]), float(mg[0])))
+            except (IndexError, TypeError, ValueError):
+                continue        # a blank or #NUM! cell is simply not a node
+        table.sort()
+    except Exception as e:
+        logger.error(f"load_td_margin_table failed: {e}")
+        return []
+    if table:
+        _margin_cache = (now, table)
+    return table
+
+
+def _excel_round(x: float) -> int:
+    """Excel's ROUND(x, 0): halves go AWAY from zero (Python's round() goes to
+    even, which would put +612.5 at +612 where the sheet says +613)."""
+    return int(math.floor(abs(x) + 0.5)) * (1 if x >= 0 else -1)
+
+
+def td_margin_price(td_true, table) -> int | None:
+    """td_true (American) with the margin curve applied — the sheet's formula:
+
+        p   = implied probability of td_true
+        m   = margin at p, linearly interpolated between the two nearest table
+              probabilities (exact match uses that row's margin)
+        out = American price of p + m, rounded like Excel's ROUND
+
+    None (a blank cell) wherever the sheet would show blank or an error: blank
+    td_true, a probability outside the table, or a margined probability >= 1.
+    """
+    if td_true is None or td_true == "" or not table:
+        return None
+    try:
+        a = float(td_true)
+    except (TypeError, ValueError):
+        return None
+    if a != a or a == 0:
+        return None
+    p = 100 / (a + 100) if a > 0 else abs(a) / (abs(a) + 100)
+    lows = [(pr, mg) for pr, mg in table if pr <= p]
+    highs = [(pr, mg) for pr, mg in table if pr >= p]
+    if not lows or not highs:
+        return None                                   # XLOOKUP -> #N/A
+    p_lo, m_lo = lows[-1]
+    p_hi, m_hi = highs[0]
+    m = m_lo if p_lo == p_hi else m_lo + (p - p_lo) / (p_hi - p_lo) * (m_hi - m_lo)
+    mp = p + m
+    if not 0 < mp < 1:
+        return None
+    if mp <= 0.5:
+        return _excel_round(100 * (1 - mp) / mp)
+    return _excel_round(-100 * mp / (1 - mp))
 
 
 def load_projections(week: int) -> pd.DataFrame:

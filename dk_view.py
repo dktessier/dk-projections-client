@@ -13,7 +13,7 @@ import streamlit as st
 import streamlit.components.v1 as _stc
 
 from team_meta import get_team_color, get_team_name, get_team_logo_path
-from sheets import load_projections as _sheets_read
+from sheets import load_projections as _sheets_read, load_td_margin_table, td_margin_price
 
 # Odds conversions, duplicated from core.math on purpose: this module is synced
 # into the PUBLIC client repo (deploy/sync-from-private.yml), which ships only
@@ -623,7 +623,7 @@ def render_dk_projections(next_week, *, show_projector=True, slate=None):
 
             _market_cols = {"Carries", "Rush Yds", "Rec", "Rec Yds", "Total Rush Yds", "Total Rush Att",
                            "Pass TDs", "INTs", "Pass Att", "Comp", "Pass Yds",
-                           "TD True"}
+                           "TD True", "TD Margin"}
 
             def _dk_render_table(tbl_df):
                 if tbl_df.empty:
@@ -693,6 +693,16 @@ def render_dk_projections(next_week, *, show_projector=True, slate=None):
                         if _na_col in _d.columns:
                             _d[_na_col] = _d[_na_col].astype(object)
                             _d.loc[_is_others, _na_col] = "N/A"
+                # TD Margin: the desk's margin curve applied to the CONSENSUS TD
+                # True, not an average of each projector's margined price — the
+                # curve is not linear, so averaging margined prices would give a
+                # number no one priced. Same function the save path uses, so the
+                # board and the sheet's td_margin column agree.
+                if "TD True" in _d.columns:
+                    _mt = load_td_margin_table()
+                    _d.insert(_d.columns.get_loc("TD True") + 1, "TD Margin",
+                              _d["TD True"].map(lambda v: td_margin_price(v, _mt)))
+                    _d["TD Margin"] = _d["TD Margin"].map(_fmt_td_price)
                 # Signed TD-True so the column reads as odds ("+580", not "580").
                 if "TD True" in _d.columns:
                     _d["TD True"] = _d["TD True"].map(_fmt_td_price)
@@ -795,7 +805,7 @@ def render_dk_projections(next_week, *, show_projector=True, slate=None):
                             _qb_df = _qb_df.rename(columns={"TD/Att%": "TD/Att", "INT/Att%": "INT/Att"})
                         # This table has no Pos column, so "TD True" (the QB's
                         # ANYTIME-TD price, not his passing TDs) goes after Player.
-                        _qb_pass_cols = ["Player", "TD True", "TD/Att", "Pass TDs", "INT/Att", "INTs", "Pass Att", "Comp", "Pass Yds", "Scrambles", "Scram Yds", "Total Rush Att", "Total Rush Yds"]
+                        _qb_pass_cols = ["Player", "TD True", "TD Margin", "TD/Att", "Pass TDs", "INT/Att", "INTs", "Pass Att", "Comp", "Pass Yds", "Scrambles", "Scram Yds", "Total Rush Att", "Total Rush Yds"]
                         _qb_pass_cols = [c for c in _qb_pass_cols if c in _qb_df.columns]
                         if _qb_pass_cols:
                             _dk_render_table(_qb_df[_qb_pass_cols].reset_index(drop=True))
@@ -805,7 +815,7 @@ def render_dk_projections(next_week, *, show_projector=True, slate=None):
                     # absent from _team_df entirely when show_projector is False
                     # (the price is never carried through the aggregation), so the
                     # filter below is what gates it out of the client view.
-                    _rush_cols = ["Player", "Pos", "TD True", "Rush Snp%", "Carry Rate", "Carry Share", "YPC", "Carries", "Rush Yds"]
+                    _rush_cols = ["Player", "Pos", "TD True", "TD Margin", "Rush Snp%", "Carry Rate", "Carry Share", "YPC", "Carries", "Rush Yds"]
                     _rush_cols = [c for c in _rush_cols if c in _team_df.columns]
                     # For QB rows, the Rushing line must reflect TOTAL rushing
                     # (designed + scrambles): the "Rush Yds"/"Carries" fields hold
@@ -833,7 +843,7 @@ def render_dk_projections(next_week, *, show_projector=True, slate=None):
                         _dk_render_table(_rush_sorted.reset_index(drop=True))
 
                     # Receiving (Others at bottom)
-                    _rec_cols = ["Player", "Pos", "TD True", "Pass Snp%", "Tgt Rate", "Tgt Share", "Catch%", "Y/Catch", "Targets", "Rec", "Rec Yds"]
+                    _rec_cols = ["Player", "Pos", "TD True", "TD Margin", "Pass Snp%", "Tgt Rate", "Tgt Share", "Catch%", "Y/Catch", "Targets", "Rec", "Rec Yds"]
                     _rec_cols = [c for c in _rec_cols if c in _team_df.columns]
                     _rec_tbl = _team_df[_team_df["Targets"].notna() & (_team_df["Targets"] > 0)][_rec_cols] if "Targets" in _team_df.columns else pd.DataFrame()
                     if not _rec_tbl.empty:
@@ -846,7 +856,7 @@ def render_dk_projections(next_week, *, show_projector=True, slate=None):
                     # Touchdowns. Its own table because the population differs:
                     # bench scorers and the D/ST row have no snaps or yards.
                     if _show_td and "TD Share" in _team_df.columns:
-                        _td_cols = [c for c in ["Player", "Pos", "TD Share", "TD True"]
+                        _td_cols = [c for c in ["Player", "Pos", "TD Share", "TD True", "TD Margin"]
                                     if c in _team_df.columns]
                         _td_tbl = _team_df[_team_df["TD Share"].notna()
                                            & (_team_df["TD Share"] > 0)][_td_cols]
