@@ -7,6 +7,7 @@ client view: no Projector dropdown, output is the plain equal average of
 all projectors for each game.
 """
 import base64 as _b64
+import html as _html
 import re as _re
 import pandas as pd
 import streamlit as st
@@ -338,9 +339,9 @@ def _render_slate_summary(week, dk_df, slate):
     """One compact block of per-team saved-projection counts for the week's slate.
 
     Deliberately small and above the filters: it is a coverage check read on the
-    way past. Red 0 / amber 1 / green 2+ per team, games sorted fewest-first, so
-    the ones to pick up next are the ones read first. Each chip is a button that
-    opens that game in the board below.
+    way past. Per team: red 0 / orange 1 / yellow 2-3 / green 4+, games sorted
+    fewest-first, so the ones to pick up next are the ones read first. Each chip is
+    a button that opens that game in the board below.
     """
     _rows = _slate_counts(dk_df, week, slate)
     if not _rows:
@@ -353,7 +354,11 @@ def _render_slate_summary(week, dk_df, slate):
     _none = _teams - _covered
 
     def _pill(n):
-        _c = "red" if n == 0 else "orange" if n == 1 else "green"
+        # Only a projection count of 4+ reads as covered (green). Streamlit's badge
+        # palette has no light-red, so 1 uses orange as the closest step between the
+        # dark red of 0 and the yellow of 2-3.
+        _c = ("red" if n == 0 else "orange" if n == 1
+              else "yellow" if n <= 3 else "green")
         return f":{_c}-background[**{n}**]"
 
     _hdr = (f'<span style="font-size:12px;font-weight:700;color:#475569;">'
@@ -375,6 +380,67 @@ def _render_slate_summary(week, dk_df, slate):
             _col.button(f"{_pill(_hc)} {_h} / {_a} {_pill(_ac)}",
                         key=f"dk_slate_{week}_{_h}_{_a}",
                         on_click=_open_game, args=(_h, _a))
+
+
+def render_desk_notes(team_rows, *, projector=None):
+    """Internal "Desk Notes" expander for ONE team's saved rows (a team+game slice).
+
+    Notes ride each save's single D/ST row (position == "DST"), so this reads them
+    off those rows alone. ``projector`` None/"Average"/"__CLIENT_WEIGHTED__" shows
+    every projector's note; a specific projector short shows just theirs. Deduped
+    to one note per save_key (latest), newest first. Renders nothing when there is
+    no note. Shared by the Saved Projections review AND the read-only panel under
+    the Projections-tab team header; callers decide visibility (never the client).
+    """
+    if team_rows is None or getattr(team_rows, "empty", True):
+        return
+    if "notes" not in team_rows.columns or "position" not in team_rows.columns:
+        return
+    src = team_rows.copy()
+    # Projector is the save_key's last segment — derive it if the caller passed
+    # raw sheet rows that have not been parsed yet.
+    if "Projector" not in src.columns and "save_key" in src.columns:
+        src["Projector"] = src["save_key"].astype(str).str.split("_").str[-1]
+    if (projector and projector not in ("Average", "__CLIENT_WEIGHTED__")
+            and "Projector" in src.columns):
+        src = src[src["Projector"] == projector]
+    src = src[(src["position"].astype(str) == "DST")
+              & (src["notes"].astype(str).str.strip() != "")]
+    if src.empty:
+        return
+    if "saved_at" in src.columns:
+        # saved_at is stored UTC; show it in Pacific (the desk's clock). utc=True
+        # localizes naive values and parses raw strings as UTC either way.
+        src = src.assign(_sa=pd.to_datetime(src["saved_at"], errors="coerce", utc=True)
+                         .dt.tz_convert("America/Los_Angeles"))
+        src = src.sort_values("_sa", ascending=False)
+        if "save_key" in src.columns:
+            src = src.drop_duplicates("save_key", keep="first")
+    # When one projector has more than one note (e.g. a base board and an injury
+    # scenario), tag each with its scenario label so they can be told apart.
+    _multi = set()
+    if "Projector" in src.columns:
+        _vc = src["Projector"].value_counts()
+        _multi = set(_vc[_vc > 1].index)
+    with st.expander(f"📝 Desk Notes ({len(src)})", expanded=False):
+        for _, _nr in src.iterrows():
+            _pj = str(_nr.get("Projector", "") or "")
+            _sa = _nr.get("_sa")
+            _when = _sa.strftime("%b %d, %H:%M %Z") if _sa is not None and pd.notna(_sa) else ""
+            _note = str(_nr.get("notes", "") or "").strip()
+            _tag = ""
+            if _pj in _multi and "save_key" in src.columns:
+                _parts = str(_nr.get("save_key", "")).split("_")
+                _scn = "_".join(_parts[1:-1]) if len(_parts) > 2 else ""
+                _tag = (f" &nbsp;·&nbsp; <span style='color:#64748b;font-size:0.85em;'>"
+                        f"{_html.escape(_scn or 'Base')}</span>")
+            st.markdown(
+                f"**{_html.escape(_pj)}**{_tag} &nbsp;·&nbsp; "
+                f"<span style='color:#64748b;font-size:0.85em;'>{_when}</span>",
+                unsafe_allow_html=True)
+            st.markdown(
+                f"<div style='white-space:pre-wrap;margin:0 0 12px 18px;'>"
+                f"{_html.escape(_note)}</div>", unsafe_allow_html=True)
 
 
 def render_dk_projections(next_week, *, show_projector=True, slate=None):
@@ -764,6 +830,13 @@ def render_dk_projections(next_week, *, show_projector=True, slate=None):
                             f'<b style="font-size:16px;">{_cnt}</b> {_cnt_label}</span>'
                         )
                     st.markdown(f'<div style="display:flex;align-items:center;margin:20px 0 6px 0;padding:8px 0;border-bottom:2px solid {_tcolor}40;">{_hdr}{_cnt_html}</div>', unsafe_allow_html=True)
+
+                    # Desk Notes (INTERNAL ONLY): matchup notes saved on each
+                    # team's D/ST row. Shown regardless of the scenario toggle (a
+                    # note is tied to a save, not to the scenario being viewed) and
+                    # never in the client view (gated on show_projector).
+                    if show_projector:
+                        render_desk_notes(_team_all, projector=_dk_projector)
 
                     # Per-team scenario toggle. Only drawn when the team has a real
                     # choice; a base-only team just notes it's Full Health (shown

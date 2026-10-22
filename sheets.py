@@ -76,6 +76,11 @@ HEADERS = [
     # prices. Computed at save time from the 'TD Margin' tab's curve (see
     # td_margin_price); blank wherever td_true is blank.
     "td_margin",
+    # Free-text team/matchup note, saved with the projection and shown to other
+    # traders reviewing it. Written on the single D/ST row of each save only (one
+    # row per team, so the review path reads notes off DST rows alone rather than
+    # every player); blank on every other row and on saves made before this column.
+    "notes",
 ]
 
 
