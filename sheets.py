@@ -81,6 +81,12 @@ HEADERS = [
     # row per team, so the review path reads notes off DST rows alone rather than
     # every player); blank on every other row and on saves made before this column.
     "notes",
+    # Top-down QB check INPUTS (the trader-entered sanity values), written on the
+    # QB row only. qb_td_att_pct / qb_int_att_pct above already carry TD/Att% and
+    # INT/Att%; these three complete the set so a loaded projection restores every
+    # QB input. Distinct from proj_comp / proj_pass_yds, which are derived OUTPUTS.
+    # Blank on non-QB rows and on saves made before these columns.
+    "qb_y_att", "qb_comp_pct", "qb_y_scramble",
 ]
 
 
