@@ -235,7 +235,13 @@ def _logo_b64(abbr: str) -> str:
         return _b64.b64encode(f.read()).decode()
 
 
-@st.cache_data(ttl=60)
+# ttl 300, not 60: this week tab is read on EVERY Projections rerun (the Load box,
+# the read-only Desk Notes panel, the scenario sweep), so at ttl=60 a keystroke
+# roughly once a minute blocked on a Google round trip mid-edit. Saved projections
+# change on the order of minutes, and the Save path calls _load_dk_projections.clear()
+# so a projector sees their own (and others') saves at once regardless — the longer
+# ttl only removes the idle refetch hitch while editing.
+@st.cache_data(ttl=300)
 def _load_dk_projections(week):
     return _sheets_read(week)
 
